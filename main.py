@@ -53,7 +53,9 @@ class DebateCardParser:
         self.seen_cards = {}
         self.near_duplicates = []
 
-    def extract_formatting_as_html(self, paragraph) -> str:
+    def extract_formatting_as_html(
+        self, paragraph, is_citation_paragraph: bool = False
+    ) -> str:
         """Convert a paragraph with rich formatting to HTML"""
         html_parts = []
 
@@ -74,8 +76,7 @@ class DebateCardParser:
             if run.style and run.style.name:
                 style_name = run.style.name.lower()
                 if any(
-                    keyword in style_name
-                    for keyword in ["cite", "bold", "strong", "emphasis"]
+                    keyword in style_name for keyword in ["bold", "strong", "emphasis"]
                 ):
                     is_bold = True
 
@@ -92,9 +93,14 @@ class DebateCardParser:
                     # Fallback if xpath fails
                     pass
 
+            # Use <cite> tags for bold text in citation paragraphs, <strong> elsewhere
             if is_bold:
-                tags.append("<strong>")
-                close_tags.insert(0, "</strong>")
+                if is_citation_paragraph:
+                    tags.append("<cite>")
+                    close_tags.insert(0, "</cite>")
+                else:
+                    tags.append("<strong>")
+                    close_tags.insert(0, "</strong>")
 
             # Check for italic formatting
             is_italic = False
@@ -160,6 +166,11 @@ class DebateCardParser:
             print(f"    Direct bold: {run.bold}")
             print(f"    Font bold: {getattr(run.font, 'bold', None)}")
             print(f"    Style: {run.style.name if run.style else 'None'}")
+            if run.style:
+                print(f"    Style ID: {getattr(run.style, 'style_id', 'None')}")
+                print(f"    Style type: {getattr(run.style, 'type', 'None')}")
+                if hasattr(run.style, "_element") and run.style._element is not None:
+                    print(f"    Style element: {run.style._element.tag}")
 
             if run._element.rPr is not None:
                 try:
@@ -180,7 +191,9 @@ class DebateCardParser:
         # self.debug_run_formatting(citation_para)
 
         citation_raw = citation_para.text
-        citation_html = self.extract_formatting_as_html(citation_para)
+        citation_html = self.extract_formatting_as_html(
+            citation_para, is_citation_paragraph=True
+        )
 
         return citation_raw, citation_html
 
@@ -381,7 +394,11 @@ class DebateCardParser:
                 tagline_html = self.extract_formatting_as_html(tagline_para)
 
                 citation_raw = citation_para.text
-                citation_html = self.extract_formatting_as_html(citation_para)
+
+                citation_html = self.extract_formatting_as_html(
+                    citation_para, is_citation_paragraph=True
+                )
+
                 citation_parts = self.parse_citation(citation_raw)
 
                 body_paras = []
