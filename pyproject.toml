@@ -1,0 +1,11 @@
+[project]
+name = "debate-parser"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "alive-progress>=3.3.0",
+    "psycopg2-binary>=2.9.10",
+    "python-docx>=1.2.0",
+]
