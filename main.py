@@ -35,6 +35,7 @@ class DebateCard:
     tagline_html: str
     citation_raw: str
     citation_html: str
+    cite: str
     author_surname: str
     author_year: str
     author_credentials: str
@@ -226,6 +227,102 @@ class DebateCardParser:
 
         return "".join(html_parts)
 
+    def extract_formatting_and_bolded_text(
+        self, paragraph, is_citation_paragraph: bool = False
+    ) -> tuple[str, str]:
+        """Convert a paragraph with rich formatting to HTML and extract bolded text"""
+        html_parts = []
+        bolded_parts = []
+
+        for run in paragraph.runs:
+            text = run.text
+            if not text:
+                continue
+
+            tags = []
+            close_tags = []
+
+            # Check for bold formatting
+            is_bold = (
+                run.bold
+                or (hasattr(run.font, "bold") and run.font.bold is True)
+                or (
+                    run.style
+                    and run.style.name
+                    and any(
+                        keyword in run.style.name.lower()
+                        for keyword in ["bold", "strong", "emphasis"]
+                    )
+                )
+            )
+
+            if not is_bold and run._element.rPr is not None:
+                try:
+                    bold_elements = self._check_xpath_cached(run._element.rPr, ".//w:b")
+                    if bold_elements:
+                        is_bold = True
+                except:
+                    pass
+
+            if is_bold:
+                bolded_parts.append(text)
+                if is_citation_paragraph:
+                    tags.append("<cite>")
+                    close_tags.insert(0, "</cite>")
+                else:
+                    tags.append("<strong>")
+                    close_tags.insert(0, "</strong>")
+
+            # Check for italic formatting
+            is_italic = run.italic or (
+                hasattr(run.font, "italic") and run.font.italic is True
+            )
+
+            if not is_italic and run._element.rPr is not None:
+                try:
+                    italic_elements = self._check_xpath_cached(
+                        run._element.rPr, ".//w:i"
+                    )
+                    if italic_elements:
+                        is_italic = True
+                except:
+                    pass
+
+            if is_italic:
+                tags.append("<em>")
+                close_tags.insert(0, "</em>")
+
+            # Check for underline
+            if run.underline:
+                tags.append("<u>")
+                close_tags.insert(0, "</u>")
+
+            # Check for highlighting
+            if run._element.rPr is not None:
+                highlight = run._element.rPr.highlight_val
+                if highlight:
+                    # Map Word highlighting to CSS colors
+                    color_map = {
+                        3: "#00FFFF",  # Turquoise
+                        4: "#00FF00",  # Green
+                        5: "#FFFF00",  # Yellow
+                        6: "#FF00FF",  # Magenta
+                        7: "#0000FF",  # Blue
+                    }
+                    bg_color = color_map.get(highlight, "#FFFF00")
+                    tags.append(f'<mark style="background-color: {bg_color};">')
+                    close_tags.insert(0, "</mark>")
+
+            if run.font.color and run.font.color.rgb:
+                color_hex = str(run.font.color.rgb)
+                tags.append(f'<span style="color: #{color_hex};">')
+                close_tags.insert(0, "</span>")
+
+            formatted_text = "".join(tags) + text + "".join(close_tags)
+            html_parts.append(formatted_text)
+
+        return "".join(html_parts), " ".join(bolded_parts)
+
     def debug_run_formatting(self, paragraph) -> None:
         """Debug function to print formatting information for each run in a paragraph"""
         print(f"\nDebugging paragraph: {paragraph.text[:100]}...")
@@ -276,7 +373,9 @@ class DebateCardParser:
 
         return " ".join(highlighted_parts)
 
-    def parse_citation(self, citation_text: str) -> Dict[str, str]:
+    def parse_citation(
+        self, citation_text: str, cite_bolded_text: str = ""
+    ) -> Dict[str, str]:
         """Parse citation text into structured components"""
         result = {
             "author_surname": "",
@@ -288,10 +387,21 @@ class DebateCardParser:
             "credits": "",
         }
 
-        author_match = self.author_year_pattern.match(citation_text)
-        if author_match:
-            result["author_surname"] = author_match.group(1)
-            result["author_year"] = author_match.group(2)
+        if cite_bolded_text:
+            bolded_parts = cite_bolded_text.split()
+            if bolded_parts:
+                result["author_surname"] = bolded_parts[0]
+
+        if not result["author_surname"]:
+            author_match = self.author_year_pattern.match(citation_text)
+            if author_match:
+                result["author_surname"] = author_match.group(1)
+                result["author_year"] = author_match.group(2)
+
+        if not result["author_year"]:
+            author_match = self.author_year_pattern.search(citation_text)
+            if author_match:
+                result["author_year"] = author_match.group(2)
 
         url_match = self.url_pattern.search(citation_text)
         if url_match:
@@ -483,12 +593,11 @@ class DebateCardParser:
         tagline = tagline_para.text
         tagline_html = self.extract_formatting_as_html(tagline_para)
         citation_raw = citation_para.text
-        citation_html = self.extract_formatting_as_html(
+        citation_html, cite_bolded = self.extract_formatting_and_bolded_text(
             citation_para, is_citation_paragraph=True
         )
-        citation_parts = self.parse_citation(citation_raw)
+        citation_parts = self.parse_citation(citation_raw, cite_bolded)
 
-        # Extract body paragraphs with generator
         body_data = self._extract_body_paragraphs(
             doc, citation_index + 1, paragraph_count
         )
@@ -508,6 +617,7 @@ class DebateCardParser:
             tagline_html=tagline_html,
             citation_raw=citation_raw,
             citation_html=citation_html,
+            cite=cite_bolded,
             author_surname=citation_parts["author_surname"],
             author_year=citation_parts["author_year"],
             author_credentials=citation_parts["author_credentials"],
@@ -702,10 +812,10 @@ class DebateCardParser:
 
         # Extract citation
         citation_raw = citation_para.text
-        citation_html = self.extract_formatting_as_html(
+        citation_html, cite_bolded = self.extract_formatting_and_bolded_text(
             citation_para, is_citation_paragraph=True
         )
-        citation_parts = self.parse_citation(citation_raw)
+        citation_parts = self.parse_citation(citation_raw, cite_bolded)
 
         # Extract body paragraphs
         body_paras = []
@@ -742,6 +852,7 @@ class DebateCardParser:
             tagline_html=tagline_html,
             citation_raw=citation_raw,
             citation_html=citation_html,
+            cite=cite_bolded,
             author_surname=citation_parts["author_surname"],
             author_year=citation_parts["author_year"],
             author_credentials=citation_parts["author_credentials"],
@@ -815,6 +926,7 @@ class DebateCardParser:
             tagline_html TEXT,
             citation_raw TEXT NOT NULL,
             citation_html TEXT,
+            cite TEXT,
             author_surname TEXT,
             author_year TEXT,
             author_credentials TEXT,
@@ -858,13 +970,13 @@ class DebateCardParser:
 
         insert_card_sql = """
         INSERT INTO debate_cards (
-            card_id, tagline, tagline_html, citation_raw, citation_html, author_surname,
+            card_id, tagline, tagline_html, citation_raw, citation_html, cite, author_surname,
             author_year, author_credentials, publication_title, publisher,
             url, credits, body_text, body_html, highlighted_text,
             source_filename, paragraph_start, paragraph_end, word_count,
             highlight_count, created_at
         ) VALUES (
-            %(card_id)s, %(tagline)s, %(tagline_html)s, %(citation_raw)s, %(citation_html)s,
+            %(card_id)s, %(tagline)s, %(tagline_html)s, %(citation_raw)s, %(citation_html)s, %(cite)s,
             %(author_surname)s, %(author_year)s, %(author_credentials)s,
             %(publication_title)s, %(publisher)s, %(url)s, %(credits)s,
             %(body_text)s, %(body_html)s, %(highlighted_text)s,
@@ -895,6 +1007,7 @@ class DebateCardParser:
                                 card.tagline_html,
                                 card.citation_raw,
                                 card.citation_html,
+                                card.cite,
                                 card.author_surname,
                                 card.author_year,
                                 card.author_credentials,
@@ -917,7 +1030,7 @@ class DebateCardParser:
 
                         bulk_insert_card_sql = """
                         INSERT INTO debate_cards (
-                            card_id, tagline, tagline_html, citation_raw, citation_html, author_surname,
+                            card_id, tagline, tagline_html, citation_raw, citation_html, cite, author_surname,
                             author_year, author_credentials, publication_title, publisher,
                             url, credits, body_text, body_html, highlighted_text,
                             source_filename, paragraph_start, paragraph_end, word_count,

@@ -8,4 +8,5 @@ dependencies = [
     "alive-progress>=3.3.0",
     "psycopg2-binary>=2.9.10",
     "python-docx>=1.2.0",
+    "datasketch>=1.6.0",
 ]
