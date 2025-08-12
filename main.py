@@ -5,19 +5,27 @@ Debate Card Parser
 
 import argparse
 import csv
+import hashlib
 import json
+import multiprocessing
 import re
 import sys
 import uuid
 import zipfile
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import docx
 import psycopg2
 from alive_progress import alive_bar
+from datasketch import MinHash
+from docx.enum.text import WD_COLOR_INDEX
+from docx.oxml.ns import qn
+from docx.shared import RGBColor
+from psycopg2.extras import RealDictCursor
 
 
 @dataclass
@@ -46,17 +54,86 @@ class DebateCard:
 
 
 class DebateCardParser:
-    def __init__(self, db_config: Optional[Dict] = None):
+    def __init__(
+        self,
+        db_config: Optional[Dict] = None,
+        debug_duplicates: bool = False,
+        skip_duplicates: bool = False,
+    ):
         self.db_config = db_config
         self.parsed_cards = []
         self.malformed_cards = []
-        self.seen_cards = {}
+        self.debug_duplicates = debug_duplicates
+        self.skip_duplicates = skip_duplicates
+
+        self.content_hashes: Set[str] = set()
+
+        self.fuzzy_hash_signatures: Set[str] = (
+            set()
+        )  # Store MinHash signatures as strings
         self.near_duplicates = []
+
+        self.num_perm = 64
+        self.similarity_threshold = 0.75
+
+        self._compile_regex_patterns()
+
+        self._xpath_cache = {}
+
+    def _compile_regex_patterns(self):
+        """Pre-compile all regex patterns used in parsing"""
+        self.author_year_pattern = re.compile(
+            r"^([A-Za-z]+(?:\s[A-Za-z]+)*)\s+(\d{2,4})"
+        )
+        self.url_pattern = re.compile(r"https?://[^\s,)]+")
+        self.title_pattern = re.compile(r'["""]([^"""]+)["""]')
+        self.credentials_pattern = re.compile(r"\[([^\]]+)\]")
+        self.credentials_check_pattern = re.compile(r"\[.*\]")
+        self.credits_pattern = re.compile(r"//\s*(.+)$")
+        self.citation_check_pattern = re.compile(r"[A-Za-z]+\s+\d{2,4}")
+
+    def _generate_content_hash(
+        self, tagline: str, author_surname: str, author_year: str, body_text: str
+    ) -> str:
+        """Generate a hash for exact duplicate detection"""
+        normalized_content = (
+            tagline.strip().lower()
+            + author_surname.strip().lower()
+            + author_year.strip()
+            + body_text.strip().lower()
+        )
+        return hashlib.sha256(normalized_content.encode("utf-8")).hexdigest()
+
+    def _generate_fuzzy_hash(self, text: str) -> MinHash:
+        """Generate MinHash for fuzzy similarity detection"""
+        normalized_text = text.strip().lower()
+        words = normalized_text.split()
+
+        minhash = MinHash(num_perm=self.num_perm)
+
+        # Add word-level tokens
+        for word in words:
+            minhash.update(word.encode("utf-8"))
+            # Add character 3-grams directly
+            for i in range(len(word) - 2):
+                minhash.update(word[i : i + 3].encode("utf-8"))
+
+        return minhash
+
+    def _compute_fuzzy_similarity(self, minhash1: MinHash, minhash2: MinHash) -> float:
+        return minhash1.jaccard(minhash2)
+
+    def _check_xpath_cached(self, element, query):
+        if query not in self._xpath_cache:
+            try:
+                self._xpath_cache[query] = element.xpath(query)
+            except:
+                self._xpath_cache[query] = []
+        return self._xpath_cache[query]
 
     def extract_formatting_as_html(
         self, paragraph, is_citation_paragraph: bool = False
     ) -> str:
-        """Convert a paragraph with rich formatting to HTML"""
         html_parts = []
 
         for run in paragraph.runs:
@@ -67,30 +144,25 @@ class DebateCardParser:
             tags = []
             close_tags = []
 
-            # Check for bold formatting
-            is_bold = False
+            is_bold = (
+                run.bold
+                or (hasattr(run.font, "bold") and run.font.bold is True)
+                or (
+                    run.style
+                    and run.style.name
+                    and any(
+                        keyword in run.style.name.lower()
+                        for keyword in ["bold", "strong", "emphasis"]
+                    )
+                )
+            )
 
-            if run.bold:
-                is_bold = True
-
-            if run.style and run.style.name:
-                style_name = run.style.name.lower()
-                if any(
-                    keyword in style_name for keyword in ["bold", "strong", "emphasis"]
-                ):
-                    is_bold = True
-
-            if hasattr(run.font, "bold") and run.font.bold is True:
-                is_bold = True
-
-            if run._element.rPr is not None:
-                # Check for <w:b/> element in the run properties
+            if not is_bold and run._element.rPr is not None:
                 try:
-                    bold_elements = run._element.rPr.xpath(".//w:b")
+                    bold_elements = self._check_xpath_cached(run._element.rPr, ".//w:b")
                     if bold_elements:
                         is_bold = True
                 except:
-                    # Fallback if xpath fails
                     pass
 
             # Use <cite> tags for bold text in citation paragraphs, <strong> elsewhere
@@ -102,22 +174,19 @@ class DebateCardParser:
                     tags.append("<strong>")
                     close_tags.insert(0, "</strong>")
 
-            # Check for italic formatting
-            is_italic = False
+            is_italic = run.italic or (
+                hasattr(run.font, "italic") and run.font.italic is True
+            )
 
-            if run.italic:
-                is_italic = True
-
-            if hasattr(run.font, "italic") and run.font.italic is True:
-                is_italic = True
-
-            if run._element.rPr is not None:
+            # Only check XML if other methods failed
+            if not is_italic and run._element.rPr is not None:
                 try:
-                    italic_elements = run._element.rPr.xpath(".//w:i")
+                    italic_elements = self._check_xpath_cached(
+                        run._element.rPr, ".//w:i"
+                    )
                     if italic_elements:
                         is_italic = True
                 except:
-                    # Fallback if xpath fails
                     pass
 
             if is_italic:
@@ -219,267 +288,275 @@ class DebateCardParser:
             "credits": "",
         }
 
-        author_match = re.match(
-            r"^([A-Za-z]+(?:\s[A-Za-z]+)*)\s+(\d{2,4})", citation_text
-        )
+        author_match = self.author_year_pattern.match(citation_text)
         if author_match:
             result["author_surname"] = author_match.group(1)
             result["author_year"] = author_match.group(2)
 
-        url_pattern = r"https?://[^\s,)]+"
-        url_match = re.search(url_pattern, citation_text)
+        url_match = self.url_pattern.search(citation_text)
         if url_match:
             result["url"] = url_match.group()
 
-        title_pattern = r'["""]([^"""]+)["""]'
-        title_match = re.search(title_pattern, citation_text)
+        title_match = self.title_pattern.search(citation_text)
         if title_match:
             result["publication_title"] = title_match.group(1)
 
-        cred_pattern = r"\[([^\]]+)\]"
-        cred_match = re.search(cred_pattern, citation_text)
+        cred_match = self.credentials_pattern.search(citation_text)
         if cred_match:
             result["author_credentials"] = cred_match.group(1)
 
-        credits_pattern = r"//\s*(.+)$"
-        credits_match = re.search(credits_pattern, citation_text)
+        credits_match = self.credits_pattern.search(citation_text)
         if credits_match:
             result["credits"] = credits_match.group(1)
 
         return result
 
     def is_duplicate(
-        self, tagline: str, author_surname: str, author_year: str, body_text: str
+        self,
+        tagline: str,
+        author_surname: str,
+        author_year: str,
+        body_text: str,
+        debug: bool = False,
     ) -> bool:
-        """Check if this card is a duplicate"""
-        duplicate_key = (
-            tagline.strip().lower(),
-            author_surname.strip().lower(),
-            author_year.strip(),
+        """Check if this card is a duplicate using hash-based detection and fuzzy hash approximate detection"""
+
+        if self.skip_duplicates:
+            return False
+
+        if debug:
+            print(f"\n=== DEBUG ===")
+            print(f"Tagline: {tagline[:50]}...")
+            print(f"Author: {author_surname} {author_year}")
+            print(f"Body length: {len(body_text)} chars")
+
+        # First, check for exact duplicates using hash lookup
+        content_hash = self._generate_content_hash(
+            tagline, author_surname, author_year, body_text
         )
 
-        for existing_key, existing_body in self.seen_cards.items():
-            existing_tagline, existing_author, existing_year = existing_key
+        if debug:
+            print(f"Content hash: {content_hash[:16]}...")
+            print(f"Hash already exists: {content_hash in self.content_hashes}")
+            print(f"Total unique hashes so far: {len(self.content_hashes)}")
 
-            # Exact match on tagline, author, year
-            if (
-                existing_tagline == tagline.strip().lower()
-                and existing_author == author_surname.strip().lower()
-                and existing_year == author_year.strip()
-            ):
-                # Check text similarity for exact duplicates
-                text_similarity = self._similarity_score(
-                    body_text.lower(), existing_body.lower()
-                )
+        if content_hash in self.content_hashes:
+            if debug:
+                print("!!EXACT DUPLICATE!!")
 
-                if text_similarity > 0.8:
-                    # This is a true duplicate
-                    self.near_duplicates.append(
-                        {
-                            "new_tagline": tagline,
-                            "existing_tagline": existing_tagline,
-                            "author": author_surname,
-                            "year": author_year,
-                            "similarity": text_similarity,
-                            "duplicate_type": "exact",
-                        }
-                    )
-                    return True
+            self.near_duplicates.append(
+                {
+                    "new_tagline": tagline,
+                    "existing_tagline": "N/A",
+                    "author": author_surname,
+                    "year": author_year,
+                    "similarity": 1.0,
+                    "duplicate_type": "exact_hash",
+                }
+            )
+            return True
 
-            # Check for near duplicates (similar tagline, same author+year)
-            elif (
-                existing_author == author_surname.strip().lower()
-                and existing_year == author_year.strip()
-                and self._similarity_score(tagline.lower(), existing_tagline) > 0.8
-            ):
-                text_similarity = self._similarity_score(
-                    body_text.lower(), existing_body.lower()
-                )
+        self.content_hashes.add(content_hash)
 
-                self.near_duplicates.append(
-                    {
-                        "new_tagline": tagline,
-                        "existing_tagline": existing_tagline,
-                        "author": author_surname,
-                        "year": author_year,
-                        "similarity": self._similarity_score(
-                            tagline.lower(), existing_tagline
-                        ),
-                        "text_similarity": text_similarity,
-                        "duplicate_type": "near",
-                    }
-                )
+        # Then, check for fuzzy duplicates using MinHash signature lookup
+        tagline_minhash = self._generate_fuzzy_hash(tagline)
+        fuzzy_signature = str(tagline_minhash.digest())
 
-        self.seen_cards[duplicate_key] = body_text.strip().lower()
+        if debug:
+            print(f"Fuzzy hash signature: {fuzzy_signature[:16]}...")
+            print(
+                f"Fuzzy signature already exists: {fuzzy_signature in self.fuzzy_hash_signatures}"
+            )
+            print(f"Total unique fuzzy signatures: {len(self.fuzzy_hash_signatures)}")
+
+        if fuzzy_signature in self.fuzzy_hash_signatures:
+            if debug:
+                print("!! FUZZY DUPLICATE")
+
+            self.near_duplicates.append(
+                {
+                    "new_tagline": tagline,
+                    "existing_tagline": "N/A (fuzzy signature match)",
+                    "author": author_surname,
+                    "year": author_year,
+                    "similarity": 0.8,
+                    "duplicate_type": "fuzzy_hash",
+                }
+            )
+            return True
+
+        self.fuzzy_hash_signatures.add(fuzzy_signature)
+
+        if debug:
+            print(f"Total fuzzy signatures: {len(self.fuzzy_hash_signatures)}")
+
         return False
-
-    def _similarity_score(self, str1: str, str2: str) -> float:
-        """Calculate similarity between two strings using simple Jaccard similarity"""
-        words1 = set(str1.split())
-        words2 = set(str2.split())
-
-        intersection = words1.intersection(words2)
-        union = words1.union(words2)
-
-        return len(intersection) / len(union) if union else 0
 
     def parse_docx(self, file, filename: str) -> List[DebateCard]:
         """Parse a single .docx file and extract debate cards"""
         doc = docx.Document(file)
         cards = []
 
-        for i in range(len(doc.paragraphs) - 1):
+        # Cache paragraph count to avoid repeated len() calls
+        paragraph_count = len(doc.paragraphs)
+
+        for i in range(paragraph_count - 1):
             # Look for Heading 4 taglines
-            if doc.paragraphs[i].style.name != "Heading 4":
+            current_para = doc.paragraphs[i]
+            if current_para.style.name != "Heading 4":
                 continue
 
-            # Check if next paragraph is citation (must be immediate next paragraph)
-            if i + 1 >= len(doc.paragraphs):
-                self.malformed_cards.append(
-                    {
-                        "filename": filename,
-                        "paragraph_index": i,
-                        "tagline": doc.paragraphs[i].text,
-                        "issue": "No next paragraph found",
-                        "context": [
-                            p.text for p in doc.paragraphs[max(0, i - 1) : i + 2]
-                        ],
-                    }
+            # Check if next paragraph exists and is citation
+            if i + 1 >= paragraph_count:
+                self._add_malformed_card(
+                    filename, i, current_para.text, "No next paragraph found", doc, i
                 )
                 continue
 
             citation_para = doc.paragraphs[i + 1]
-            citation_index = i + 1
-
-            if not (
-                citation_para.style.name in ["Normal", "Normal (Web)"]
-                and len(citation_para.text) >= 10
-                and (
-                    re.search(r"[A-Za-z]+\s+\d{2,4}", citation_para.text)  # Author Year
-                    or re.search(
-                        r"\[.*\]", citation_para.text
-                    )  # Credentials in brackets
-                    or "http" in citation_para.text.lower()
-                    or ".org" in citation_para.text.lower()
-                    or ".com" in citation_para.text.lower()
-                    or ".edu" in citation_para.text.lower()
-                    or any(
-                        word in citation_para.text.lower()
-                        for word in [
-                            "professor",
-                            "university",
-                            "phd",
-                            "dr.",
-                            "institute",
-                        ]
-                    )
-                )
-            ):
-                self.malformed_cards.append(
-                    {
-                        "filename": filename,
-                        "paragraph_index": i,
-                        "tagline": doc.paragraphs[i].text,
-                        "issue": "No valid citation found",
-                        "context": [
-                            p.text for p in doc.paragraphs[max(0, i - 1) : i + 4]
-                        ],
-                    }
+            if not self._is_valid_citation(citation_para):
+                self._add_malformed_card(
+                    filename, i, current_para.text, "No valid citation found", doc, i
                 )
                 continue
 
             try:
-                tagline_para = doc.paragraphs[i]
-                tagline = tagline_para.text
-                tagline_html = self.extract_formatting_as_html(tagline_para)
-
-                citation_raw = citation_para.text
-
-                citation_html = self.extract_formatting_as_html(
-                    citation_para, is_citation_paragraph=True
+                card = self._create_card_from_paragraphs(
+                    doc, i, filename, paragraph_count
                 )
-
-                citation_parts = self.parse_citation(citation_raw)
-
-                body_paras = []
-                body_html_parts = []
-                highlighted_parts = []
-                end_para = citation_index + 1
-
-                for j in range(citation_index + 1, len(doc.paragraphs)):
-                    para = doc.paragraphs[j]
-
-                    if (
-                        para.style.name not in ["Normal", "List Paragraph"]
-                        or para.text.strip() == ""
+                if card:
+                    # Check for duplicates before adding
+                    if not self.is_duplicate(
+                        card.tagline,
+                        card.author_surname,
+                        card.author_year,
+                        card.body_text,
+                        debug=self.debug_duplicates,
                     ):
-                        end_para = j - 1
-                        break
-
-                    body_paras.append(para.text)
-                    body_html_parts.append(self.extract_formatting_as_html(para))
-
-                    highlighted = self.extract_highlighted_text(para)
-                    if highlighted:
-                        highlighted_parts.append(highlighted)
-
-                    end_para = j
-
-                body_text = "\n".join(body_paras)
-
-                if self.is_duplicate(
-                    tagline,
-                    citation_parts["author_surname"],
-                    citation_parts["author_year"],
-                    body_text,
-                ):
-                    continue
-
-                body_html = "<p>" + "</p>\n<p>".join(body_html_parts) + "</p>"
-                highlighted_text = " ".join(highlighted_parts)
-
-                card = DebateCard(
-                    card_id=str(uuid.uuid4()),
-                    tagline=tagline,
-                    tagline_html=tagline_html,
-                    citation_raw=citation_raw,
-                    citation_html=citation_html,
-                    author_surname=citation_parts["author_surname"],
-                    author_year=citation_parts["author_year"],
-                    author_credentials=citation_parts["author_credentials"],
-                    publication_title=citation_parts["publication_title"],
-                    publisher=citation_parts["publisher"],
-                    url=citation_parts["url"],
-                    credits=citation_parts["credits"],
-                    body_text=body_text,
-                    body_html=body_html,
-                    highlighted_text=highlighted_text,
-                    source_filename=filename,
-                    paragraph_start=i,
-                    paragraph_end=end_para,
-                    word_count=len(body_text.split()),
-                    highlight_count=len(highlighted_parts),
-                    created_at=datetime.now().isoformat(),
-                )
-
-                cards.append(card)
-
+                        cards.append(card)
             except Exception as e:
-                # Handle parsing errors
-                self.malformed_cards.append(
-                    {
-                        "filename": filename,
-                        "paragraph_index": i,
-                        "tagline": doc.paragraphs[i].text[:100],
-                        "issue": f"Parsing error: {str(e)}",
-                        "context": [
-                            p.text[:100] for p in doc.paragraphs[max(0, i - 1) : i + 3]
-                        ],
-                    }
+                self._add_malformed_card(
+                    filename,
+                    i,
+                    current_para.text[:100],
+                    f"Parsing error: {str(e)}",
+                    doc,
+                    i,
                 )
-                continue
 
         return cards
+
+    def _add_malformed_card(
+        self,
+        filename: str,
+        para_index: int,
+        tagline: str,
+        issue: str,
+        doc,
+        context_index: int,
+    ):
+        """Helper to add malformed card - reduces code duplication"""
+        self.malformed_cards.append(
+            {
+                "filename": filename,
+                "paragraph_index": para_index,
+                "tagline": tagline,
+                "issue": issue,
+                "context": [
+                    p.text[:100]
+                    for p in doc.paragraphs[
+                        max(0, context_index - 1) : context_index + 4
+                    ]
+                ],
+            }
+        )
+
+    def _create_card_from_paragraphs(
+        self, doc, tagline_index: int, filename: str, paragraph_count: int
+    ) -> Optional[DebateCard]:
+        """Create a DebateCard from document paragraphs starting at tagline_index"""
+        tagline_para = doc.paragraphs[tagline_index]
+        citation_para = doc.paragraphs[tagline_index + 1]
+        citation_index = tagline_index + 1
+
+        # Extract tagline and citation
+        tagline = tagline_para.text
+        tagline_html = self.extract_formatting_as_html(tagline_para)
+        citation_raw = citation_para.text
+        citation_html = self.extract_formatting_as_html(
+            citation_para, is_citation_paragraph=True
+        )
+        citation_parts = self.parse_citation(citation_raw)
+
+        # Extract body paragraphs with generator
+        body_data = self._extract_body_paragraphs(
+            doc, citation_index + 1, paragraph_count
+        )
+        body_paras, body_html_parts, highlighted_parts, end_para = body_data
+
+        body_text = "\n".join(body_paras)
+        body_html = (
+            "<p>" + "</p>\n<p>".join(body_html_parts) + "</p>"
+            if body_html_parts
+            else ""
+        )
+        highlighted_text = " ".join(highlighted_parts)
+
+        return DebateCard(
+            card_id=str(uuid.uuid4()),
+            tagline=tagline,
+            tagline_html=tagline_html,
+            citation_raw=citation_raw,
+            citation_html=citation_html,
+            author_surname=citation_parts["author_surname"],
+            author_year=citation_parts["author_year"],
+            author_credentials=citation_parts["author_credentials"],
+            publication_title=citation_parts["publication_title"],
+            publisher=citation_parts["publisher"],
+            url=citation_parts["url"],
+            credits=citation_parts["credits"],
+            body_text=body_text,
+            body_html=body_html,
+            highlighted_text=highlighted_text,
+            source_filename=filename,
+            paragraph_start=tagline_index,
+            paragraph_end=end_para,
+            word_count=len(body_text.split()) if body_text else 0,
+            highlight_count=len(highlighted_parts),
+            created_at=datetime.now().isoformat(),
+        )
+
+    def _extract_body_paragraphs(
+        self, doc, start_index: int, paragraph_count: int
+    ) -> Tuple[List[str], List[str], List[str], int]:
+        """Extract body paragraphs efficiently"""
+        body_paras = []
+        body_html_parts = []
+        highlighted_parts = []
+        end_para = start_index
+
+        for j in range(start_index, paragraph_count):
+            para = doc.paragraphs[j]
+
+            # Stop at non-body paragraphs or empty paragraphs
+            if (
+                para.style.name not in ["Normal", "List Paragraph"]
+                or not para.text.strip()
+            ):
+                end_para = j - 1
+                break
+
+            body_paras.append(para.text)
+            body_html_parts.append(self.extract_formatting_as_html(para))
+
+            # Extract highlighted text if present
+            highlighted = self.extract_highlighted_text(para)
+            if highlighted:
+                highlighted_parts.append(highlighted)
+
+            end_para = j
+
+        return body_paras, body_html_parts, highlighted_parts, end_para
 
     def parse_single_docx(self, docx_path: str) -> None:
         """Parse a single .docx file"""
@@ -494,8 +571,13 @@ class DebateCardParser:
         except Exception as e:
             print(f"Error processing {filename}: {e}")
 
-    def parse_zip_archive(self, zip_path: str) -> None:
-        """Parse all .docx files in a zip archive"""
+    def parse_zip_archive(
+        self,
+        zip_path: str,
+        use_multiprocessing: bool = True,
+        max_workers: Optional[int] = None,
+    ) -> None:
+        """Parse all .docx files in a zip archive with optional multiprocessing"""
         with zipfile.ZipFile(zip_path, "r") as zf:
             docx_files = [
                 f
@@ -507,16 +589,195 @@ class DebateCardParser:
 
             print(f"Found {len(docx_files)} .docx files in archive")
 
-            with alive_bar(len(docx_files), title="Parsing documents") as bar:
-                for file_info in docx_files:
-                    try:
-                        with zf.open(file_info.filename) as docx_file:
-                            cards = self.parse_docx(docx_file, file_info.filename)
-                            self.parsed_cards.extend(cards)
-                    except Exception as e:
-                        print(f"Error processing {file_info.filename}: {e}")
+            if not use_multiprocessing or len(docx_files) < 4:
+                with alive_bar(len(docx_files), title="Parsing documents") as bar:
+                    for file_info in docx_files:
+                        try:
+                            with zf.open(file_info.filename) as docx_file:
+                                cards = self.parse_docx(docx_file, file_info.filename)
+                                self.parsed_cards.extend(cards)
+                        except Exception as e:
+                            print(f"Error processing {file_info.filename}: {e}")
+                        bar()
+            else:
+                if max_workers is None:
+                    max_workers = min(multiprocessing.cpu_count(), len(docx_files))
 
-                    bar()
+                temp_files = []
+                for file_info in docx_files:
+                    with zf.open(file_info.filename) as docx_file:
+                        temp_files.append((docx_file.read(), file_info.filename))
+
+                with ProcessPoolExecutor(max_workers=max_workers) as executor:
+                    with alive_bar(
+                        len(temp_files), title="Parsing documents (parallel)"
+                    ) as bar:
+                        future_to_file = {
+                            executor.submit(
+                                self._parse_docx_data, file_data, filename
+                            ): filename
+                            for file_data, filename in temp_files
+                        }
+
+                        for future in as_completed(future_to_file):
+                            filename = future_to_file[future]
+                            try:
+                                cards, malformed = future.result()
+                                self.parsed_cards.extend(cards)
+                                self.malformed_cards.extend(malformed)
+                            except Exception as e:
+                                print(f"Error processing {filename}: {e}")
+                            bar()
+
+    def _parse_docx_data(
+        self, file_data: bytes, filename: str
+    ) -> Tuple[List[DebateCard], List[Dict]]:
+        """Parse docx data"""
+        import tempfile
+        from io import BytesIO
+
+        with BytesIO(file_data) as file_obj:
+            try:
+                doc = docx.Document(file_obj)
+                cards = []
+                malformed_cards = []
+
+                temp_parser = DebateCardParser(
+                    db_config=None,
+                    debug_duplicates=self.debug_duplicates,
+                    skip_duplicates=True,
+                )
+
+                for i in range(len(doc.paragraphs) - 1):
+                    if doc.paragraphs[i].style.name != "Heading 4":
+                        continue
+
+                    try:
+                        card = temp_parser._parse_card_at_index(doc, i, filename)
+                        if card:
+                            cards.append(card)
+                    except Exception as e:
+                        malformed_cards.append(
+                            {
+                                "filename": filename,
+                                "paragraph_index": i,
+                                "tagline": doc.paragraphs[i].text[:100],
+                                "issue": f"Parsing error: {str(e)}",
+                                "context": [
+                                    p.text[:100]
+                                    for p in doc.paragraphs[max(0, i - 1) : i + 3]
+                                ],
+                            }
+                        )
+
+                return cards, malformed_cards
+            except Exception as e:
+                return [], [
+                    {
+                        "filename": filename,
+                        "paragraph_index": -1,
+                        "tagline": "Document error",
+                        "issue": f"Document parsing error: {str(e)}",
+                        "context": [],
+                    }
+                ]
+
+    def _parse_card_at_index(self, doc, i: int, filename: str) -> Optional[DebateCard]:
+        """Extract a single card at the given paragraph index"""
+        # Check if next paragraph is citation
+        if i + 1 >= len(doc.paragraphs):
+            return None
+
+        citation_para = doc.paragraphs[i + 1]
+        citation_index = i + 1
+
+        # Validate citation paragraph
+        if not self._is_valid_citation(citation_para):
+            return None
+
+        # Extract tagline
+        tagline_para = doc.paragraphs[i]
+        tagline = tagline_para.text
+        tagline_html = self.extract_formatting_as_html(tagline_para)
+
+        # Extract citation
+        citation_raw = citation_para.text
+        citation_html = self.extract_formatting_as_html(
+            citation_para, is_citation_paragraph=True
+        )
+        citation_parts = self.parse_citation(citation_raw)
+
+        # Extract body paragraphs
+        body_paras = []
+        body_html_parts = []
+        highlighted_parts = []
+        end_para = citation_index + 1
+
+        for j in range(citation_index + 1, len(doc.paragraphs)):
+            para = doc.paragraphs[j]
+
+            if (
+                para.style.name not in ["Normal", "List Paragraph"]
+                or para.text.strip() == ""
+            ):
+                end_para = j - 1
+                break
+
+            body_paras.append(para.text)
+            body_html_parts.append(self.extract_formatting_as_html(para))
+
+            highlighted = self.extract_highlighted_text(para)
+            if highlighted:
+                highlighted_parts.append(highlighted)
+
+            end_para = j
+
+        body_text = "\n".join(body_paras)
+        body_html = "<p>" + "</p>\n<p>".join(body_html_parts) + "</p>"
+        highlighted_text = " ".join(highlighted_parts)
+
+        return DebateCard(
+            card_id=str(uuid.uuid4()),
+            tagline=tagline,
+            tagline_html=tagline_html,
+            citation_raw=citation_raw,
+            citation_html=citation_html,
+            author_surname=citation_parts["author_surname"],
+            author_year=citation_parts["author_year"],
+            author_credentials=citation_parts["author_credentials"],
+            publication_title=citation_parts["publication_title"],
+            publisher=citation_parts["publisher"],
+            url=citation_parts["url"],
+            credits=citation_parts["credits"],
+            body_text=body_text,
+            body_html=body_html,
+            highlighted_text=highlighted_text,
+            source_filename=filename,
+            paragraph_start=i,
+            paragraph_end=end_para,
+            word_count=len(body_text.split()),
+            highlight_count=len(highlighted_parts),
+            created_at=datetime.now().isoformat(),
+        )
+
+    def _is_valid_citation(self, citation_para) -> bool:
+        """Check if a paragraph is a valid citation"""
+        return (
+            citation_para.style.name in ["Normal", "Normal (Web)"]
+            and len(citation_para.text) >= 10
+            and (
+                self.citation_check_pattern.search(citation_para.text)
+                or self.credentials_check_pattern.search(citation_para.text)
+                or "http" in citation_para.text.lower()
+                or ".org" in citation_para.text.lower()
+                or ".com" in citation_para.text.lower()
+                or ".edu" in citation_para.text.lower()
+                or any(
+                    word in citation_para.text.lower()
+                    for word in ["professor", "university", "phd", "dr.", "institute"]
+                )
+            )
+        )
 
     def save_malformed_cards_to_docx(self, output_path: str) -> None:
         """Save malformed cards to a separate .docx file for review"""
@@ -622,33 +883,119 @@ class DebateCardParser:
 
         with psycopg2.connect(**self.db_config) as conn:
             with conn.cursor() as cur:
-                # Insert cards
-                for card in self.parsed_cards:
-                    try:
-                        cur.execute(insert_card_sql, asdict(card))
-                    except Exception as e:
-                        print(f"Error inserting card {card.card_id}: {e}")
+                try:
+                    # Bulk insert cards using execute_values
+                    if self.parsed_cards:
+                        from psycopg2.extras import execute_values
 
-                # Insert duplicates
-                for dup in self.near_duplicates:
-                    try:
-                        dup_data = {
-                            "new_tagline": dup["new_tagline"],
-                            "existing_tagline": dup["existing_tagline"],
-                            "author": dup["author"],
-                            "year": dup["year"],
-                            "similarity": dup["similarity"],
-                            "text_similarity": dup.get("text_similarity", 0.0),
-                            "duplicate_type": dup["duplicate_type"],
-                        }
-                        cur.execute(insert_duplicate_sql, dup_data)
-                    except Exception as e:
-                        print(f"Error inserting duplicate record: {e}")
+                        card_values = [
+                            (
+                                card.card_id,
+                                card.tagline,
+                                card.tagline_html,
+                                card.citation_raw,
+                                card.citation_html,
+                                card.author_surname,
+                                card.author_year,
+                                card.author_credentials,
+                                card.publication_title,
+                                card.publisher,
+                                card.url,
+                                card.credits,
+                                card.body_text,
+                                card.body_html,
+                                card.highlighted_text,
+                                card.source_filename,
+                                card.paragraph_start,
+                                card.paragraph_end,
+                                card.word_count,
+                                card.highlight_count,
+                                card.created_at,
+                            )
+                            for card in self.parsed_cards
+                        ]
 
-                conn.commit()
+                        bulk_insert_card_sql = """
+                        INSERT INTO debate_cards (
+                            card_id, tagline, tagline_html, citation_raw, citation_html, author_surname,
+                            author_year, author_credentials, publication_title, publisher,
+                            url, credits, body_text, body_html, highlighted_text,
+                            source_filename, paragraph_start, paragraph_end, word_count,
+                            highlight_count, created_at
+                        ) VALUES %s
+                        """
 
-        print(f"Successfully saved {len(self.parsed_cards)} cards to database")
-        print(f"Found {len(self.near_duplicates)} duplicates")
+                        execute_values(
+                            cur, bulk_insert_card_sql, card_values, page_size=1000
+                        )
+
+                    # Bulk insert duplicates
+                    if self.near_duplicates:
+                        duplicate_values = [
+                            (
+                                dup["new_tagline"],
+                                dup["existing_tagline"],
+                                dup["author"],
+                                dup["year"],
+                                dup["similarity"],
+                                dup.get("text_similarity", 0.0),
+                                dup["duplicate_type"],
+                            )
+                            for dup in self.near_duplicates
+                        ]
+
+                        bulk_insert_dup_sql = """
+                        INSERT INTO duplicates (
+                            new_tagline, existing_tagline, author, year, similarity_score,
+                            text_similarity_score, duplicate_type
+                        ) VALUES %s
+                        """
+
+                        execute_values(
+                            cur, bulk_insert_dup_sql, duplicate_values, page_size=1000
+                        )
+
+                    conn.commit()
+                    print(
+                        f"Successfully saved {len(self.parsed_cards)} cards to database (bulk insert)"
+                    )
+                    print(f"Found {len(self.near_duplicates)} duplicates")
+
+                except Exception as e:
+                    conn.rollback()
+                    print(
+                        f"Bulk insert failed ({e}), falling back to individual inserts..."
+                    )
+
+                    # Fallback to individual inserts
+                    success_count = 0
+                    for card in self.parsed_cards:
+                        try:
+                            cur.execute(insert_card_sql, asdict(card))
+                            success_count += 1
+                        except Exception as e:
+                            print(f"Error inserting card {card.card_id}: {e}")
+
+                    for dup in self.near_duplicates:
+                        try:
+                            dup_data = {
+                                "new_tagline": dup["new_tagline"],
+                                "existing_tagline": dup["existing_tagline"],
+                                "author": dup["author"],
+                                "year": dup["year"],
+                                "similarity": dup["similarity"],
+                                "text_similarity": dup.get("text_similarity", 0.0),
+                                "duplicate_type": dup["duplicate_type"],
+                            }
+                            cur.execute(insert_duplicate_sql, dup_data)
+                        except Exception as e:
+                            print(f"Error inserting duplicate record: {e}")
+
+                    conn.commit()
+                    print(
+                        f"Successfully saved {success_count} cards to database (individual inserts)"
+                    )
+                    print(f"Found {len(self.near_duplicates)} duplicates")
 
     def export_to_csv(self, output_path: str) -> None:
         """Export parsed cards to CSV for backup/analysis"""
@@ -693,6 +1040,19 @@ def main():
     )
     db_group.add_argument("--db-password", default="", help="Database password")
 
+    # Debug options
+    debug_group = arg_parser.add_argument_group("debug options")
+    debug_group.add_argument(
+        "--debug-duplicates",
+        action="store_true",
+        help="Enable detailed duplicate detection debugging",
+    )
+    debug_group.add_argument(
+        "--skip-duplicates",
+        action="store_true",
+        help="Disable duplicate checking entirely (faster parsing)",
+    )
+
     args = arg_parser.parse_args()
 
     input_path = args.input_file
@@ -715,7 +1075,11 @@ def main():
         }
 
     # Initialize parser
-    parser = DebateCardParser(db_config)
+    parser = DebateCardParser(
+        db_config,
+        debug_duplicates=args.debug_duplicates,
+        skip_duplicates=args.skip_duplicates,
+    )
 
     if db_config:
         try:
@@ -728,7 +1092,7 @@ def main():
     print(f"Starting to parse {input_path}...")
 
     if input_path.lower().endswith(".zip"):
-        parser.parse_zip_archive(input_path)
+        parser.parse_zip_archive(input_path, use_multiprocessing=True)
     elif input_path.lower().endswith(".docx"):
         parser.parse_single_docx(input_path)
     else:
@@ -738,7 +1102,11 @@ def main():
     print(f"\nParsing complete!")
     print(f"Successfully parsed: {len(parser.parsed_cards)} cards")
     print(f"Malformed cards: {len(parser.malformed_cards)}")
-    print(f"Duplicates found: {len(parser.near_duplicates)}")
+
+    if args.skip_duplicates:
+        print("Duplicate checking was disabled")
+    else:
+        print(f"Duplicates found: {len(parser.near_duplicates)}")
 
     # Generate output files
     base_path = Path(input_path).stem
