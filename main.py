@@ -88,6 +88,11 @@ def main():
         malformed_path = f"{base_path}_malformed_cards.docx"
         parser.save_malformed_cards_to_docx(malformed_path)
 
+    # Save duplicate cards
+    if not args.skip_duplicates and parser.near_duplicates:
+        duplicates_path = f"{base_path}_duplicate_cards.docx"
+        parser.save_duplicates_to_docx(duplicates_path)
+
     csv_path = f"{base_path}_parsed_cards.csv"
     export_to_csv(parser.parsed_cards, csv_path)
 
@@ -95,6 +100,8 @@ def main():
     print(f"  - Parsed cards: {csv_path}")
     if parser.malformed_cards:
         print(f"  - Malformed cards: {base_path}_malformed_cards.docx")
+    if not args.skip_duplicates and parser.near_duplicates:
+        print(f"  - Duplicate cards: {base_path}_duplicate_cards.docx")
 
 
 if __name__ == "__main__":

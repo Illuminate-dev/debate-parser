@@ -15,8 +15,13 @@ class CitationParser:
         self.title_pattern = re.compile(r'["""]([^"""]+)["""]')
         self.credentials_pattern = re.compile(r"\[([^\]]+)\]")
         self.credentials_check_pattern = re.compile(r"\[.*\]")
-        self.credits_pattern = re.compile(r"//\s*(.+)$")
+        self.credits_pattern = re.compile(
+            r"(?:(?<!https:)//\s*(.+)|(?:^|\s)-\s*([A-Z][A-Za-z\s]*))$"
+        )
         self.citation_check_pattern = re.compile(r"[A-Za-z]+\s+\d{2,4}")
+        self.credit_initials_pattern = re.compile(
+            r"(?://?\s*[A-Z]{1,4}(?:\s|$)|-\s*[A-Z]{1,4}(?:\s|$))"
+        )
 
     def parse_citation(
         self, citation_text: str, cite_bolded_text: str = ""
@@ -62,7 +67,22 @@ class CitationParser:
 
         credits_match = self.credits_pattern.search(citation_text)
         if credits_match:
-            result["credits"] = credits_match.group(1)
+            result["credits"] = credits_match.group(1) or credits_match.group(2)
+        else:
+            url_match = self.url_pattern.search(citation_text)
+            if url_match:
+                url_end = url_match.end()
+                remainder = citation_text[url_end:].strip()
+                if remainder:
+                    remainder = re.sub(r"^[,\s\)]+", "", remainder)
+                    if remainder:
+                        result["credits"] = remainder
+            else:
+                words = citation_text.split()
+                if words:
+                    result["credits"] = words[-1]
+
+        result["cite"] = result["author_surname"] + " " + result["author_year"]
 
         return result
 
@@ -72,8 +92,9 @@ class CitationParser:
             citation_para.style.name in ["Normal", "Normal (Web)"]
             and len(citation_para.text) >= 10
             and (
-                self.citation_check_pattern.search(citation_para.text)
-                or self.credentials_check_pattern.search(citation_para.text)
+                bool(self.citation_check_pattern.search(citation_para.text))
+                or bool(self.credentials_check_pattern.search(citation_para.text))
+                or bool(self.credit_initials_pattern.search(citation_para.text))
                 or "http" in citation_para.text.lower()
                 or ".org" in citation_para.text.lower()
                 or ".com" in citation_para.text.lower()

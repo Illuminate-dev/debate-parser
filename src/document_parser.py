@@ -12,8 +12,15 @@ from alive_progress import alive_bar
 from datasketch import MinHash
 
 from .citation_parser import CitationParser
+from .duplicate_detector import DuplicateDetector, FastDuplicateDetector
 from .html_formatter import HTMLFormatter
 from .models import DebateCard
+
+
+class SkipFileException(Exception):
+    """Exception raised when file is skipped in testing mode"""
+
+    pass
 
 
 class DebateCardParser:
@@ -27,12 +34,8 @@ class DebateCardParser:
         self.debug_duplicates = debug_duplicates
         self.skip_duplicates = skip_duplicates
 
-        self.content_hashes: Set[str] = set()
-
-        self.fuzzy_hash_signatures: Set[str] = (
-            set()
-        )  # Store MinHash signatures as strings
-        self.near_duplicates = []
+        self.duplicate_detector = DuplicateDetector()
+        self.is_worker_process = False  # Track if this is a worker process
 
         self.num_perm = 64
         self.similarity_threshold = 0.75
@@ -45,16 +48,13 @@ class DebateCardParser:
         doc = docx.Document(file)
         cards = []
 
-        # Cache paragraph count to avoid repeated len() calls
         paragraph_count = len(doc.paragraphs)
 
         for i in range(paragraph_count - 1):
-            # Look for Heading 4 taglines
             current_para = doc.paragraphs[i]
             if current_para.style.name != "Heading 4":
                 continue
 
-            # Check if next paragraph exists and is citation
             if i + 1 >= paragraph_count:
                 self._add_malformed_card(
                     filename, i, current_para.text, "No next paragraph found", doc, i
@@ -74,12 +74,25 @@ class DebateCardParser:
                 )
                 if card:
                     # Check for duplicates before adding
+                    card_info = {
+                        "tagline": card.tagline,
+                        "author_surname": card.author_surname,
+                        "author_year": card.author_year,
+                        "body_text": (
+                            card.body_text[:200] + "..."
+                            if len(card.body_text) > 200
+                            else card.body_text
+                        ),
+                        "source_filename": filename,
+                        "card_id": card.card_id,
+                    }
+
                     if not self._is_duplicate(
                         card.tagline,
                         card.author_surname,
                         card.author_year,
                         card.body_text,
-                        debug=self.debug_duplicates,
+                        card_info,
                     ):
                         cards.append(card)
 
@@ -107,8 +120,10 @@ class DebateCardParser:
         tagline = tagline_para.text
         tagline_html = self.html_formatter.extract_formatting_as_html(tagline_para)
         citation_raw = citation_para.text
-        citation_html, cite_bolded = self.html_formatter.extract_formatting_and_bolded_text(
-            citation_para, is_citation_paragraph=True
+        citation_html, cite_bolded = (
+            self.html_formatter.extract_formatting_and_bolded_text(
+                citation_para, is_citation_paragraph=True
+            )
         )
         citation_parts = self.citation_parser.parse_citation(citation_raw, cite_bolded)
 
@@ -199,44 +214,31 @@ class DebateCardParser:
             "issue": issue,
             "context": [
                 p.text[:100]
-                for p in doc.paragraphs[
-                    max(0, context_index - 1) : context_index + 4
-                ]
+                for p in doc.paragraphs[max(0, context_index - 1) : context_index + 4]
             ],
         }
 
         self.malformed_cards.append(malformed_card)
+        if self.testing_mode:
+            self._handle_testing_mode_pause(malformed_card, filename)
 
-    def _generate_content_hash(
-        self, tagline: str, author_surname: str, author_year: str, body_text: str
-    ) -> str:
-        """Generate a hash for exact duplicate detection"""
-        normalized_content = (
-            tagline.strip().lower()
-            + author_surname.strip().lower()
-            + author_year.strip()
-            + body_text.strip().lower()
-        )
-        return hashlib.sha256(normalized_content.encode("utf-8")).hexdigest()
+    def _save_single_malformed_card(self, card: dict, output_path: str) -> None:
+        """Save a single malformed card to a docx file"""
+        doc = docx.Document()
+        doc.add_heading("Malformed Card - Testing Mode", 0)
 
-    def _generate_fuzzy_hash(self, text: str) -> MinHash:
-        """Generate MinHash for fuzzy similarity detection"""
-        normalized_text = text.strip().lower()
-        words = normalized_text.split()
+        doc.add_heading(f"Issue: {card['issue']}", level=1)
+        doc.add_paragraph(f"File: {card['filename']}")
+        doc.add_paragraph(f"Paragraph Index: {card['paragraph_index']}")
+        doc.add_paragraph(f"Tagline: {card['tagline']}")
 
-        minhash = MinHash(num_perm=self.num_perm)
+        doc.add_heading("Context:", level=2)
+        for j, context_para in enumerate(card["context"]):
+            p = doc.add_paragraph(f"Para {j}: {context_para}")
+            if j == 1:  # Highlight the problematic paragraph
+                p.runs[0].bold = True
 
-        # Add word-level tokens
-        for word in words:
-            minhash.update(word.encode("utf-8"))
-            # Add character 3-grams directly
-            for i in range(len(word) - 2):
-                minhash.update(word[i : i + 3].encode("utf-8"))
-
-        return minhash
-
-    def _compute_fuzzy_similarity(self, minhash1: MinHash, minhash2: MinHash) -> float:
-        return minhash1.jaccard(minhash2)
+        doc.save(output_path)
 
     def _is_duplicate(
         self,
@@ -244,80 +246,145 @@ class DebateCardParser:
         author_surname: str,
         author_year: str,
         body_text: str,
-        debug: bool = False,
+        card_info: Optional[dict] = None,
     ) -> bool:
         """Check if this card is a duplicate using hash-based detection and fuzzy hash approximate detection"""
 
         if self.skip_duplicates:
             return False
 
-        if debug:
-            print(f"\n=== DEBUG ===")
-            print(f"Tagline: {tagline[:50]}...")
-            print(f"Author: {author_surname} {author_year}")
-            print(f"Body length: {len(body_text)} chars")
+        content_key = f"{tagline} {author_surname} {author_year} {body_text}"
 
-        # First, check for exact duplicates using hash lookup
-        content_hash = self._generate_content_hash(
-            tagline, author_surname, author_year, body_text
-        )
+        if card_info is None:
+            card_info = {
+                "tagline": tagline,
+                "author_surname": author_surname,
+                "author_year": author_year,
+                "body_text": (
+                    body_text[:200] + "..." if len(body_text) > 200 else body_text
+                ),
+            }
 
-        if debug:
-            print(f"Content hash: {content_hash[:16]}...")
-            print(f"Hash already exists: {content_hash in self.content_hashes}")
-            print(f"Total unique hashes so far: {len(self.content_hashes)}")
-
-        if content_hash in self.content_hashes:
-            if debug:
-                print("!!EXACT DUPLICATE!!")
-
-            self.near_duplicates.append(
-                {
-                    "new_tagline": tagline,
-                    "existing_tagline": "N/A",
-                    "author": author_surname,
-                    "year": author_year,
-                    "similarity": 1.0,
-                    "duplicate_type": "exact_hash",
-                }
-            )
+        if self.duplicate_detector.check(content_key, card_info):
             return True
 
-        self.content_hashes.add(content_hash)
-
-        # Then, check for fuzzy duplicates using MinHash signature lookup
-        tagline_minhash = self._generate_fuzzy_hash(tagline)
-        fuzzy_signature = str(tagline_minhash.digest())
-
-        if debug:
-            print(f"Fuzzy hash signature: {fuzzy_signature[:16]}...")
-            print(
-                f"Fuzzy signature already exists: {fuzzy_signature in self.fuzzy_hash_signatures}"
-            )
-            print(f"Total unique fuzzy signatures: {len(self.fuzzy_hash_signatures)}")
-
-        if fuzzy_signature in self.fuzzy_hash_signatures:
-            if debug:
-                print("!! FUZZY DUPLICATE")
-
-            self.near_duplicates.append(
-                {
-                    "new_tagline": tagline,
-                    "existing_tagline": "N/A (fuzzy signature match)",
-                    "author": author_surname,
-                    "year": author_year,
-                    "similarity": 0.8,
-                    "duplicate_type": "fuzzy_hash",
-                }
-            )
-            return True
-
-        self.fuzzy_hash_signatures.add(fuzzy_signature)
-
-        if debug:
-            print(f"Total fuzzy signatures: {len(self.fuzzy_hash_signatures)}")
+        content_id = f"{author_surname}_{author_year}_{len(self.parsed_cards)}"
+        self.duplicate_detector.add(content_key, content_id)
 
         return False
+
+    @property
+    def near_duplicates(self):
+        """Property to access detected duplicates for compatibility with main.py"""
+        return self.duplicate_detector.detected_duplicates
+
+    def save_duplicates_to_docx(self, output_path: str) -> None:
+        """Save detected duplicate cards to a separate .docx file for review"""
+        duplicates = self.duplicate_detector.detected_duplicates
+        if not duplicates:
+            return
+
+        doc = docx.Document()
+        doc.add_heading("Duplicate Cards Detected by MinHashLSH", 0)
+
+        doc.add_paragraph(
+            f"Found {len(duplicates)} duplicate cards with similarity threshold ≥ 75%"
+        )
+        doc.add_paragraph("")
+
+        for i, dup_info in enumerate(duplicates):
+            doc.add_heading(f"Duplicate Card {i + 1}", level=1)
+
+            card = dup_info["duplicate_card"]
+
+            # Card details
+            doc.add_paragraph(f"Source File: {card.get('source_filename', 'Unknown')}")
+            doc.add_paragraph(f"Card ID: {card.get('card_id', 'N/A')}")
+            doc.add_paragraph(f"Similarity Score: {dup_info['similarity_score']:.2%}")
+            doc.add_paragraph(
+                f"Detection Method: {dup_info.get('detection_method', 'fuzzy_minhashlsh')}"
+            )
+            if "original_content_id" in dup_info:
+                doc.add_paragraph(
+                    f"Original Content ID: {dup_info['original_content_id']}"
+                )
+            if "original_content_hash" in dup_info:
+                doc.add_paragraph(
+                    f"Content Hash: {dup_info['original_content_hash'][:16]}..."
+                )
+
+            # Card content
+            doc.add_heading("Tagline:", level=2)
+            doc.add_paragraph(card.get("tagline", "N/A"))
+
+            doc.add_heading("Author & Year:", level=2)
+            author_info = f"{card.get('author_surname', 'Unknown')} ({card.get('author_year', 'Unknown')})"
+            doc.add_paragraph(author_info)
+
+            doc.add_heading("Body Text (Preview):", level=2)
+            doc.add_paragraph(card.get("body_text", "N/A"))
+
+            doc.add_paragraph("")  # Add spacing between entries
+
+        doc.save(output_path)
+        print(f"Saved {len(duplicates)} duplicate cards to {output_path}")
+
+    def post_process_fuzzy_duplicates(self) -> None:
+        """Post-process all parsed cards for fuzzy duplicate detection using MinHashLSH"""
+        if not self.parsed_cards:
+            return
+
+        print(f"Post-processing {len(self.parsed_cards)} cards for fuzzy duplicates...")
+
+        # Create fresh MinHashLSH detector for fuzzy matching
+        fuzzy_detector = DuplicateDetector()
+        fuzzy_duplicates = []
+        unique_cards = []
+
+        for card in self.parsed_cards:
+            content_key = f"{card.tagline} {card.author_surname} {card.author_year} {card.body_text}"
+            card_info = {
+                "tagline": card.tagline,
+                "author_surname": card.author_surname,
+                "author_year": card.author_year,
+                "body_text": (
+                    card.body_text[:200] + "..."
+                    if len(card.body_text) > 200
+                    else card.body_text
+                ),
+                "source_filename": card.source_filename,
+                "card_id": card.card_id,
+            }
+
+            if fuzzy_detector.check(content_key, card_info):
+                # This is a fuzzy duplicate
+                fuzzy_duplicates.extend(
+                    fuzzy_detector.detected_duplicates[-1:]
+                )  # Get the last added duplicate
+            else:
+                # Not a duplicate, keep it and add to detector
+                unique_cards.append(card)
+                fuzzy_detector.add(content_key, card.card_id)
+
+        # Update parsed cards to only include unique ones
+        removed_count = len(self.parsed_cards) - len(unique_cards)
+        self.parsed_cards = unique_cards
+
+        # Combine with exact duplicates from workers if they exist
+        all_duplicates = fuzzy_duplicates
+        if hasattr(self, "_worker_exact_duplicates"):
+            all_duplicates.extend(self._worker_exact_duplicates)
+
+        # Update the duplicate detector's detected duplicates for output
+        self.duplicate_detector.detected_duplicates = all_duplicates
+
+        print(
+            f"Fuzzy duplicate detection removed {removed_count} additional duplicates"
+        )
+        if hasattr(self, "_worker_exact_duplicates"):
+            print(
+                f"Total duplicates detected: {len(all_duplicates)} (exact: {len(self._worker_exact_duplicates)}, fuzzy: {len(fuzzy_duplicates)})"
+            )
 
     def parse_single_docx(self, docx_path: str) -> None:
         """Parse a single .docx file"""
@@ -350,6 +417,11 @@ class DebateCardParser:
 
             print(f"Found {len(docx_files)} .docx files in archive")
 
+            if self.testing_mode:
+                print(
+                    "Testing mode enabled - using single-threaded processing for interactive experience"
+                )
+
             if not use_multiprocessing or len(docx_files) < 4:
                 with alive_bar(len(docx_files), title="Parsing documents") as bar:
                     for file_info in docx_files:
@@ -380,23 +452,29 @@ class DebateCardParser:
                             for file_data, filename in temp_files
                         }
 
+                        worker_exact_duplicates = []
                         for future in as_completed(future_to_file):
                             filename = future_to_file[future]
                             try:
-                                cards, malformed = future.result()
+                                cards, malformed, exact_duplicates = future.result()
                                 self.parsed_cards.extend(cards)
                                 self.malformed_cards.extend(malformed)
+                                worker_exact_duplicates.extend(exact_duplicates)
                             except Exception as e:
                                 print(f"Error processing {filename}: {e}")
                             bar()
 
+                # Store exact duplicates found by workers
+                self._worker_exact_duplicates = worker_exact_duplicates
+
+                # Post-process for fuzzy duplicates across all workers
+                if not self.skip_duplicates:
+                    self.post_process_fuzzy_duplicates()
+
     def _parse_docx_data(
         self, file_data: bytes, filename: str
-    ) -> Tuple[List[DebateCard], List[Dict]]:
+    ) -> Tuple[List[DebateCard], List[Dict], List[Dict]]:
         """Parse docx data"""
-        import tempfile
-        from io import BytesIO
-
         with BytesIO(file_data) as file_obj:
             try:
                 doc = docx.Document(file_obj)
@@ -405,8 +483,11 @@ class DebateCardParser:
 
                 temp_parser = DebateCardParser(
                     debug_duplicates=self.debug_duplicates,
-                    skip_duplicates=True,
+                    skip_duplicates=False,
+                    testing_mode=False,
                 )
+                temp_parser.duplicate_detector = FastDuplicateDetector()
+                temp_parser.is_worker_process = True
 
                 for i in range(len(doc.paragraphs) - 1):
                     if doc.paragraphs[i].style.name != "Heading 4":
@@ -415,7 +496,28 @@ class DebateCardParser:
                     try:
                         card = temp_parser._parse_card_at_index(doc, i, filename)
                         if card:
-                            cards.append(card)
+                            # Check for exact duplicates using fast detector
+                            content_key = f"{card.tagline} {card.author_surname} {card.author_year} {card.body_text}"
+                            card_info = {
+                                "tagline": card.tagline,
+                                "author_surname": card.author_surname,
+                                "author_year": card.author_year,
+                                "body_text": (
+                                    card.body_text[:200] + "..."
+                                    if len(card.body_text) > 200
+                                    else card.body_text
+                                ),
+                                "source_filename": filename,
+                                "card_id": card.card_id,
+                            }
+
+                            if not temp_parser.duplicate_detector.check(
+                                content_key, card_info
+                            ):
+                                cards.append(card)
+                                temp_parser.duplicate_detector.add(
+                                    content_key, card.card_id
+                                )
                     except Exception as e:
                         malformed_cards.append(
                             {
@@ -430,17 +532,23 @@ class DebateCardParser:
                             }
                         )
 
-                return cards, malformed_cards
+                # Include exact duplicates found by the worker
+                exact_duplicates = temp_parser.duplicate_detector.detected_duplicates
+                return cards, malformed_cards, exact_duplicates
             except Exception as e:
-                return [], [
-                    {
-                        "filename": filename,
-                        "paragraph_index": -1,
-                        "tagline": "Document error",
-                        "issue": f"Document parsing error: {str(e)}",
-                        "context": [],
-                    }
-                ]
+                return (
+                    [],
+                    [
+                        {
+                            "filename": filename,
+                            "paragraph_index": -1,
+                            "tagline": "Document error",
+                            "issue": f"Document parsing error: {str(e)}",
+                            "context": [],
+                        }
+                    ],
+                    [],
+                )
 
     def _parse_card_at_index(self, doc, i: int, filename: str) -> Optional[DebateCard]:
         """Extract a single card at the given paragraph index"""
@@ -462,8 +570,10 @@ class DebateCardParser:
 
         # Extract citation
         citation_raw = citation_para.text
-        citation_html, cite_bolded = self.html_formatter.extract_formatting_and_bolded_text(
-            citation_para, is_citation_paragraph=True
+        citation_html, cite_bolded = (
+            self.html_formatter.extract_formatting_and_bolded_text(
+                citation_para, is_citation_paragraph=True
+            )
         )
         citation_parts = self.citation_parser.parse_citation(citation_raw, cite_bolded)
 
