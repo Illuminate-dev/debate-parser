@@ -28,11 +28,15 @@ class DebateCardParser:
         self,
         debug_duplicates: bool = False,
         skip_duplicates: bool = False,
+        testing_mode: bool = False,
+        database_handler=None,
     ):
         self.parsed_cards = []
         self.malformed_cards = []
         self.debug_duplicates = debug_duplicates
         self.skip_duplicates = skip_duplicates
+        self.testing_mode = testing_mode
+        self.database_handler = database_handler
 
         self.duplicate_detector = DuplicateDetector()
         self.is_worker_process = False  # Track if this is a worker process
@@ -42,6 +46,16 @@ class DebateCardParser:
 
         self.html_formatter = HTMLFormatter()
         self.citation_parser = CitationParser()
+
+    def _save_cards_to_database(self, cards: List[DebateCard]) -> None:
+        """Save cards to database"""
+        if self.database_handler and cards:
+            try:
+                saved_count = self.database_handler.save_debate_cards_batch(cards)
+                if saved_count > 0:
+                    print(f"Saved {saved_count} cards to database")
+            except Exception as e:
+                print(f"Warning: Failed to save cards to database: {e}")
 
     def parse_docx(self, file, filename: str) -> List[DebateCard]:
         """Parse a single .docx file and extract debate cards"""
@@ -395,6 +409,7 @@ class DebateCardParser:
             with open(docx_path, "rb") as docx_file:
                 cards = self.parse_docx(docx_file, filename)
                 self.parsed_cards.extend(cards)
+                self._save_cards_to_database(cards)
                 print(f"Found {len(cards)} cards in {filename}")
         except Exception as e:
             print(f"Error processing {filename}: {e}")
@@ -432,6 +447,8 @@ class DebateCardParser:
                         except Exception as e:
                             print(f"Error processing {file_info.filename}: {e}")
                         bar()
+
+                self._save_cards_to_database(self.parsed_cards)
             else:
                 if max_workers is None:
                     max_workers = min(multiprocessing.cpu_count(), len(docx_files))
@@ -447,7 +464,10 @@ class DebateCardParser:
                     ) as bar:
                         future_to_file = {
                             executor.submit(
-                                self._parse_docx_data, file_data, filename
+                                DebateCardParser._parse_docx_data,
+                                file_data,
+                                filename,
+                                self.debug_duplicates,
                             ): filename
                             for file_data, filename in temp_files
                         }
@@ -471,8 +491,12 @@ class DebateCardParser:
                 if not self.skip_duplicates:
                     self.post_process_fuzzy_duplicates()
 
+                # Save all unique cards to database after duplicate removal
+                self._save_cards_to_database(self.parsed_cards)
+
+    @staticmethod
     def _parse_docx_data(
-        self, file_data: bytes, filename: str
+        file_data: bytes, filename: str, debug_duplicates: bool = False
     ) -> Tuple[List[DebateCard], List[Dict], List[Dict]]:
         """Parse docx data"""
         with BytesIO(file_data) as file_obj:
@@ -482,9 +506,10 @@ class DebateCardParser:
                 malformed_cards = []
 
                 temp_parser = DebateCardParser(
-                    debug_duplicates=self.debug_duplicates,
+                    debug_duplicates=debug_duplicates,
                     skip_duplicates=False,
                     testing_mode=False,
+                    database_handler=None,
                 )
                 temp_parser.duplicate_detector = FastDuplicateDetector()
                 temp_parser.is_worker_process = True

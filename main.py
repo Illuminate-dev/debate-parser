@@ -10,6 +10,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from src import DebateCard, DebateCardParser
+from src.database import create_database_handler
 
 
 def export_to_csv(cards: list, output_path: str) -> None:
@@ -52,14 +53,64 @@ def main():
         action="store_true",
         help="Disable duplicate checking entirely (faster parsing)",
     )
+    debug_group.add_argument(
+        "--testing-mode",
+        action="store_true",
+        help="Pause when malformed cards are encountered and save them immediately for review",
+    )
+
+    db_group = arg_parser.add_argument_group("database options")
+    db_group.add_argument(
+        "--db-host",
+        default="localhost",
+        help="PostgreSQL database host (default: localhost)",
+    )
+    db_group.add_argument(
+        "--db-port",
+        type=int,
+        default=5432,
+        help="PostgreSQL database port (default: 5432)",
+    )
+    db_group.add_argument(
+        "--db-name",
+        help="PostgreSQL database name",
+    )
+    db_group.add_argument(
+        "--db-user",
+        default="postgres",
+        help="PostgreSQL database username (default: postgres)",
+    )
+    db_group.add_argument(
+        "--db-password",
+        help="PostgreSQL database password",
+    )
+
     args = arg_parser.parse_args()
 
     input_path = args.input_file
+
+    # Initialize database handler if database options are provided
+    database_handler = None
+    if args.db_host and args.db_name and args.db_user:
+        password = args.db_password or ""
+        database_handler = create_database_handler(
+            host=args.db_host,
+            port=args.db_port,
+            database=args.db_name,
+            user=args.db_user,
+            password=password,
+        )
+        if database_handler:
+            print(f"Connected to database: {args.db_name}")
+        else:
+            print("Failed to connect to database - continuing without database storage")
 
     # Initialize parser
     parser = DebateCardParser(
         debug_duplicates=args.debug_duplicates,
         skip_duplicates=args.skip_duplicates,
+        testing_mode=args.testing_mode,
+        database_handler=database_handler,
     )
 
     print(f"Starting to parse {input_path}...")
@@ -79,7 +130,7 @@ def main():
     if args.skip_duplicates:
         print("Duplicate checking was disabled")
     else:
-        print(f"Duplicates found: {len(parser.near_duplicates)}")
+        print(f"Duplicates found: {len(parser.duplicate_detector.detected_duplicates)}")
 
     # Generate output files
     base_path = Path(input_path).stem
@@ -89,19 +140,28 @@ def main():
         parser.save_malformed_cards_to_docx(malformed_path)
 
     # Save duplicate cards
-    if not args.skip_duplicates and parser.near_duplicates:
+    if not args.skip_duplicates and parser.duplicate_detector.detected_duplicates:
         duplicates_path = f"{base_path}_duplicate_cards.docx"
         parser.save_duplicates_to_docx(duplicates_path)
 
-    csv_path = f"{base_path}_parsed_cards.csv"
-    export_to_csv(parser.parsed_cards, csv_path)
+    # Export to CSV only if not using database
+    if not database_handler:
+        csv_path = f"{base_path}_parsed_cards.csv"
+        export_to_csv(parser.parsed_cards, csv_path)
 
     print(f"\nOutput files created:")
-    print(f"  - Parsed cards: {csv_path}")
+    if not database_handler:
+        print(f"  - Parsed cards: {csv_path}")
+    else:
+        print(f"  - Parsed cards saved to database: {args.db_name}")
     if parser.malformed_cards:
         print(f"  - Malformed cards: {base_path}_malformed_cards.docx")
-    if not args.skip_duplicates and parser.near_duplicates:
+    if not args.skip_duplicates and parser.duplicate_detector.detected_duplicates:
         print(f"  - Duplicate cards: {base_path}_duplicate_cards.docx")
+
+    # Clean up database connection
+    if database_handler:
+        database_handler.disconnect()
 
 
 if __name__ == "__main__":

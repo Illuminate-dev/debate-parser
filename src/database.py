@@ -1,0 +1,232 @@
+import logging
+from dataclasses import asdict
+from typing import List, Optional
+
+import psycopg2
+from psycopg2.extras import RealDictCursor
+
+from .models import DebateCard
+
+
+class DatabaseHandler:
+    def __init__(self, host: str, port: int, database: str, user: str, password: str):
+        self.host = host
+        self.port = port
+        self.database = database
+        self.user = user
+        self.password = password
+        self.connection = None
+        self.logger = logging.getLogger(__name__)
+
+    def connect(self) -> bool:
+        """Establish database connection"""
+        try:
+            self.connection = psycopg2.connect(
+                host=self.host,
+                port=self.port,
+                database=self.database,
+                user=self.user,
+                password=self.password,
+                cursor_factory=RealDictCursor,
+            )
+            self.logger.info(f"Connected to PostgreSQL database: {self.database}")
+            return True
+        except psycopg2.Error as e:
+            self.logger.error(f"Failed to connect to database: {e}")
+            return False
+
+    def disconnect(self):
+        """Close database connection"""
+        if self.connection:
+            self.connection.close()
+            self.logger.info("Database connection closed")
+
+    def create_tables(self):
+        """Create necessary database tables"""
+        create_debate_cards_table = """
+        CREATE TABLE IF NOT EXISTS debate_cards (
+            id SERIAL PRIMARY KEY,
+            card_id VARCHAR(255) UNIQUE NOT NULL,
+            tagline TEXT,
+            tagline_html TEXT,
+            citation_raw TEXT,
+            citation_html TEXT,
+            cite TEXT,
+            author_surname VARCHAR(255),
+            author_year VARCHAR(50),
+            author_credentials TEXT,
+            publication_title TEXT,
+            publisher TEXT,
+            url TEXT,
+            credits VARCHAR(255),
+            body_text TEXT,
+            body_html TEXT,
+            highlighted_text TEXT,
+            source_filename VARCHAR(255),
+            paragraph_start INTEGER,
+            paragraph_end INTEGER,
+            word_count INTEGER,
+            highlight_count INTEGER,
+            created_at TIMESTAMP,
+            inserted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        """
+
+        create_duplicates_table = """
+        CREATE TABLE IF NOT EXISTS duplicates (
+            id SERIAL PRIMARY KEY,
+            original_card_id VARCHAR(255) REFERENCES debate_cards(card_id),
+            duplicate_card_id VARCHAR(255) REFERENCES debate_cards(card_id),
+            similarity_score FLOAT,
+            detection_method VARCHAR(50),
+            detected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        """
+
+        try:
+            with self.connection.cursor() as cursor:
+                cursor.execute(create_debate_cards_table)
+                cursor.execute(create_duplicates_table)
+                self.connection.commit()
+                self.logger.info("Database tables created successfully")
+        except psycopg2.Error as e:
+            self.logger.error(f"Failed to create tables: {e}")
+            self.connection.rollback()
+            raise
+
+    def save_debate_card(self, card: DebateCard) -> bool:
+        """Save a single debate card to the database"""
+        insert_query = """
+        INSERT INTO debate_cards (
+            card_id, tagline, tagline_html, citation_raw, citation_html, cite,
+            author_surname, author_year, author_credentials, publication_title,
+            publisher, url, credits, body_text, body_html, highlighted_text,
+            source_filename, paragraph_start, paragraph_end, word_count,
+            highlight_count, created_at
+        ) VALUES (
+            %(card_id)s, %(tagline)s, %(tagline_html)s, %(citation_raw)s, %(citation_html)s, %(cite)s,
+            %(author_surname)s, %(author_year)s, %(author_credentials)s, %(publication_title)s,
+            %(publisher)s, %(url)s, %(credits)s, %(body_text)s, %(body_html)s, %(highlighted_text)s,
+            %(source_filename)s, %(paragraph_start)s, %(paragraph_end)s, %(word_count)s,
+            %(highlight_count)s, %(created_at)s
+        ) ON CONFLICT (card_id) DO NOTHING;
+        """
+
+        try:
+            with self.connection.cursor() as cursor:
+                card_dict = asdict(card)
+                cursor.execute(insert_query, card_dict)
+                self.connection.commit()
+                return True
+        except psycopg2.Error as e:
+            self.logger.error(f"Failed to save debate card {card.card_id}: {e}")
+            self.connection.rollback()
+            return False
+
+    def save_debate_cards_batch(self, cards: List[DebateCard]) -> int:
+        """Save multiple debate cards in a batch operation"""
+        if not cards:
+            return 0
+
+        insert_query = """
+        INSERT INTO debate_cards (
+            card_id, tagline, tagline_html, citation_raw, citation_html, cite,
+            author_surname, author_year, author_credentials, publication_title,
+            publisher, url, credits, body_text, body_html, highlighted_text,
+            source_filename, paragraph_start, paragraph_end, word_count,
+            highlight_count, created_at
+        ) VALUES (
+            %(card_id)s, %(tagline)s, %(tagline_html)s, %(citation_raw)s, %(citation_html)s, %(cite)s,
+            %(author_surname)s, %(author_year)s, %(author_credentials)s, %(publication_title)s,
+            %(publisher)s, %(url)s, %(credits)s, %(body_text)s, %(body_html)s, %(highlighted_text)s,
+            %(source_filename)s, %(paragraph_start)s, %(paragraph_end)s, %(word_count)s,
+            %(highlight_count)s, %(created_at)s
+        ) ON CONFLICT (card_id) DO NOTHING;
+        """
+
+        saved_count = 0
+        for card in cards:
+            try:
+                with self.connection.cursor() as cursor:
+                    card_dict = asdict(card)
+                    cursor.execute(insert_query, card_dict)
+                    if cursor.rowcount > 0:
+                        saved_count += 1
+                    self.connection.commit()
+            except psycopg2.Error as e:
+                # Debug logging to identify which field is too long
+                card_dict = asdict(card)
+                long_fields = []
+                for field_name, value in card_dict.items():
+                    if isinstance(value, str) and len(value) > 255:
+                        if field_name in [
+                            "author_surname",
+                            "credits",
+                            "source_filename",
+                        ]:
+                            long_fields.append(f"{field_name}({len(value)})")
+
+                if long_fields:
+                    self.logger.warning(
+                        f"Failed to save card {card.card_id}: {e}. Long fields: {', '.join(long_fields)}"
+                    )
+                else:
+                    self.logger.warning(f"Failed to save card {card.card_id}: {e}")
+
+                self.connection.rollback()
+                continue
+
+        self.logger.info(
+            f"Successfully saved {saved_count}/{len(cards)} debate cards to database"
+        )
+        return saved_count
+
+    def save_duplicate_record(
+        self, original_id: str, duplicate_id: str, similarity: float, method: str
+    ):
+        """Record a duplicate detection result"""
+        insert_query = """
+        INSERT INTO duplicates (original_card_id, duplicate_card_id, similarity_score, detection_method)
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT DO NOTHING;
+        """
+
+        try:
+            with self.connection.cursor() as cursor:
+                cursor.execute(
+                    insert_query, (original_id, duplicate_id, similarity, method)
+                )
+                self.connection.commit()
+        except psycopg2.Error as e:
+            self.logger.error(f"Failed to save duplicate record: {e}")
+            self.connection.rollback()
+
+    def get_card_count(self) -> int:
+        """Get total number of cards in database"""
+        try:
+            with self.connection.cursor() as cursor:
+                cursor.execute("SELECT COUNT(*) FROM debate_cards")
+                result = cursor.fetchone()
+                return result[0] if result else 0
+        except psycopg2.Error as e:
+            self.logger.error(f"Failed to get card count: {e}")
+            return 0
+
+
+def create_database_handler(
+    host: str, port: int, database: str, user: str, password: str
+) -> Optional[DatabaseHandler]:
+    """Factory function to create and initialize database handler"""
+    handler = DatabaseHandler(host, port, database, user, password)
+
+    if handler.connect():
+        try:
+            handler.create_tables()
+            return handler
+        except Exception as e:
+            logging.error(f"Failed to initialize database: {e}")
+            handler.disconnect()
+            return None
+    else:
+        return None
+
