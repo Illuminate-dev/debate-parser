@@ -115,6 +115,13 @@ class DatabaseHandler:
         try:
             with self.connection.cursor() as cursor:
                 card_dict = asdict(card)
+                # Truncate fields that exceed VARCHAR limits
+                if len(card_dict.get('credits', '')) > 255:
+                    card_dict['credits'] = card_dict['credits'][:255]
+                    self.logger.warning(f"Truncated credits field for card {card.card_id} from {len(card.credits)} to 255 characters")
+                if len(card_dict.get('author_surname', '')) > 255:
+                    card_dict['author_surname'] = card_dict['author_surname'][:255]
+                    self.logger.warning(f"Truncated author_surname field for card {card.card_id} from {len(card.author_surname)} to 255 characters")
                 cursor.execute(insert_query, card_dict)
                 self.connection.commit()
                 return True
@@ -149,6 +156,13 @@ class DatabaseHandler:
             try:
                 with self.connection.cursor() as cursor:
                     card_dict = asdict(card)
+                    # Truncate fields that exceed VARCHAR limits
+                    if len(card_dict.get('credits', '')) > 255:
+                        card_dict['credits'] = card_dict['credits'][:255]
+                        self.logger.warning(f"Truncated credits field for card {card.card_id} from {len(card.credits)} to 255 characters")
+                    if len(card_dict.get('author_surname', '')) > 255:
+                        card_dict['author_surname'] = card_dict['author_surname'][:255]
+                        self.logger.warning(f"Truncated author_surname field for card {card.card_id} from {len(card.author_surname)} to 255 characters")
                     cursor.execute(insert_query, card_dict)
                     if cursor.rowcount > 0:
                         saved_count += 1
@@ -211,6 +225,55 @@ class DatabaseHandler:
         except psycopg2.Error as e:
             self.logger.error(f"Failed to get card count: {e}")
             return 0
+    
+    def get_all_cards(self) -> List[DebateCard]:
+        """Load all existing cards from the database"""
+        try:
+            with self.connection.cursor() as cursor:
+                cursor.execute("""
+                    SELECT card_id, tagline, tagline_html, citation_raw, citation_html, cite,
+                           author_surname, author_year, author_credentials, publication_title,
+                           publisher, url, credits, body_text, body_html, highlighted_text,
+                           source_filename, paragraph_start, paragraph_end, word_count,
+                           highlight_count, created_at
+                    FROM debate_cards
+                    ORDER BY inserted_at
+                """)
+                rows = cursor.fetchall()
+                
+                cards = []
+                for row in rows:
+                    card = DebateCard(
+                        card_id=row['card_id'],
+                        tagline=row['tagline'] or '',
+                        tagline_html=row['tagline_html'] or '',
+                        citation_raw=row['citation_raw'] or '',
+                        citation_html=row['citation_html'] or '',
+                        cite=row['cite'] or '',
+                        author_surname=row['author_surname'] or '',
+                        author_year=row['author_year'] or '',
+                        author_credentials=row['author_credentials'] or '',
+                        publication_title=row['publication_title'] or '',
+                        publisher=row['publisher'] or '',
+                        url=row['url'] or '',
+                        credits=row['credits'] or '',
+                        body_text=row['body_text'] or '',
+                        body_html=row['body_html'] or '',
+                        highlighted_text=row['highlighted_text'] or '',
+                        source_filename=row['source_filename'] or '',
+                        paragraph_start=row['paragraph_start'] or 0,
+                        paragraph_end=row['paragraph_end'] or 0,
+                        word_count=row['word_count'] or 0,
+                        highlight_count=row['highlight_count'] or 0,
+                        created_at=row['created_at'] or ''
+                    )
+                    cards.append(card)
+                
+                self.logger.info(f"Loaded {len(cards)} existing cards from database")
+                return cards
+        except psycopg2.Error as e:
+            self.logger.error(f"Failed to load cards from database: {e}")
+            return []
 
 
 def create_database_handler(
