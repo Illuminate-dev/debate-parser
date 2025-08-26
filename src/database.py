@@ -116,12 +116,16 @@ class DatabaseHandler:
             with self.connection.cursor() as cursor:
                 card_dict = asdict(card)
                 # Truncate fields that exceed VARCHAR limits
-                if len(card_dict.get('credits', '')) > 255:
-                    card_dict['credits'] = card_dict['credits'][:255]
-                    self.logger.warning(f"Truncated credits field for card {card.card_id} from {len(card.credits)} to 255 characters")
-                if len(card_dict.get('author_surname', '')) > 255:
-                    card_dict['author_surname'] = card_dict['author_surname'][:255]
-                    self.logger.warning(f"Truncated author_surname field for card {card.card_id} from {len(card.author_surname)} to 255 characters")
+                if len(card_dict.get("credits", "")) > 255:
+                    card_dict["credits"] = card_dict["credits"][:255]
+                    self.logger.warning(
+                        f"Truncated credits field for card {card.card_id} from {len(card.credits)} to 255 characters"
+                    )
+                if len(card_dict.get("author_surname", "")) > 255:
+                    card_dict["author_surname"] = card_dict["author_surname"][:255]
+                    self.logger.warning(
+                        f"Truncated author_surname field for card {card.card_id} from {len(card.author_surname)} to 255 characters"
+                    )
                 cursor.execute(insert_query, card_dict)
                 self.connection.commit()
                 return True
@@ -157,12 +161,16 @@ class DatabaseHandler:
                 with self.connection.cursor() as cursor:
                     card_dict = asdict(card)
                     # Truncate fields that exceed VARCHAR limits
-                    if len(card_dict.get('credits', '')) > 255:
-                        card_dict['credits'] = card_dict['credits'][:255]
-                        self.logger.warning(f"Truncated credits field for card {card.card_id} from {len(card.credits)} to 255 characters")
-                    if len(card_dict.get('author_surname', '')) > 255:
-                        card_dict['author_surname'] = card_dict['author_surname'][:255]
-                        self.logger.warning(f"Truncated author_surname field for card {card.card_id} from {len(card.author_surname)} to 255 characters")
+                    if len(card_dict.get("credits", "")) > 255:
+                        card_dict["credits"] = card_dict["credits"][:255]
+                        self.logger.warning(
+                            f"Truncated credits field for card {card.card_id} from {len(card.credits)} to 255 characters"
+                        )
+                    if len(card_dict.get("author_surname", "")) > 255:
+                        card_dict["author_surname"] = card_dict["author_surname"][:255]
+                        self.logger.warning(
+                            f"Truncated author_surname field for card {card.card_id} from {len(card.author_surname)} to 255 characters"
+                        )
                     cursor.execute(insert_query, card_dict)
                     if cursor.rowcount > 0:
                         saved_count += 1
@@ -199,6 +207,46 @@ class DatabaseHandler:
         self, original_id: str, duplicate_id: str, similarity: float, method: str
     ):
         """Record a duplicate detection result"""
+        try:
+            with self.connection.cursor() as cursor:
+                cursor.execute("""
+                    SELECT column_name FROM information_schema.columns 
+                    WHERE table_name = 'duplicates' AND table_schema = 'public'
+                """)
+                columns = [row["column_name"] for row in cursor.fetchall()]
+
+                if not columns:
+                    self.logger.warning(
+                        "Duplicates table does not exist, creating it..."
+                    )
+                    self.create_tables()
+                    return self.save_duplicate_record(
+                        original_id, duplicate_id, similarity, method
+                    )
+
+                expected_columns = [
+                    "original_card_id",
+                    "duplicate_card_id",
+                    "similarity_score",
+                    "detection_method",
+                ]
+                if not all(col in columns for col in expected_columns):
+                    self.logger.warning(
+                        f"Duplicates table schema mismatch. Found columns: {columns}"
+                    )
+                    self.logger.warning(
+                        "Recreating duplicates table with correct schema..."
+                    )
+                    cursor.execute("DROP TABLE IF EXISTS duplicates")
+                    self.connection.commit()
+                    self.create_tables()
+                    return self.save_duplicate_record(
+                        original_id, duplicate_id, similarity, method
+                    )
+        except psycopg2.Error as e:
+            self.logger.error(f"Failed to check duplicates table schema: {e}")
+            return
+
         insert_query = """
         INSERT INTO duplicates (original_card_id, duplicate_card_id, similarity_score, detection_method)
         VALUES (%s, %s, %s, %s)
@@ -225,7 +273,7 @@ class DatabaseHandler:
         except psycopg2.Error as e:
             self.logger.error(f"Failed to get card count: {e}")
             return 0
-    
+
     def get_all_cards(self) -> List[DebateCard]:
         """Load all existing cards from the database"""
         try:
@@ -240,39 +288,97 @@ class DatabaseHandler:
                     ORDER BY inserted_at
                 """)
                 rows = cursor.fetchall()
-                
+
                 cards = []
                 for row in rows:
                     card = DebateCard(
-                        card_id=row['card_id'],
-                        tagline=row['tagline'] or '',
-                        tagline_html=row['tagline_html'] or '',
-                        citation_raw=row['citation_raw'] or '',
-                        citation_html=row['citation_html'] or '',
-                        cite=row['cite'] or '',
-                        author_surname=row['author_surname'] or '',
-                        author_year=row['author_year'] or '',
-                        author_credentials=row['author_credentials'] or '',
-                        publication_title=row['publication_title'] or '',
-                        publisher=row['publisher'] or '',
-                        url=row['url'] or '',
-                        credits=row['credits'] or '',
-                        body_text=row['body_text'] or '',
-                        body_html=row['body_html'] or '',
-                        highlighted_text=row['highlighted_text'] or '',
-                        source_filename=row['source_filename'] or '',
-                        paragraph_start=row['paragraph_start'] or 0,
-                        paragraph_end=row['paragraph_end'] or 0,
-                        word_count=row['word_count'] or 0,
-                        highlight_count=row['highlight_count'] or 0,
-                        created_at=row['created_at'] or ''
+                        card_id=row["card_id"],
+                        tagline=row["tagline"] or "",
+                        tagline_html=row["tagline_html"] or "",
+                        citation_raw=row["citation_raw"] or "",
+                        citation_html=row["citation_html"] or "",
+                        cite=row["cite"] or "",
+                        author_surname=row["author_surname"] or "",
+                        author_year=row["author_year"] or "",
+                        author_credentials=row["author_credentials"] or "",
+                        publication_title=row["publication_title"] or "",
+                        publisher=row["publisher"] or "",
+                        url=row["url"] or "",
+                        credits=row["credits"] or "",
+                        body_text=row["body_text"] or "",
+                        body_html=row["body_html"] or "",
+                        highlighted_text=row["highlighted_text"] or "",
+                        source_filename=row["source_filename"] or "",
+                        paragraph_start=row["paragraph_start"] or 0,
+                        paragraph_end=row["paragraph_end"] or 0,
+                        word_count=row["word_count"] or 0,
+                        highlight_count=row["highlight_count"] or 0,
+                        created_at=row["created_at"] or "",
                     )
                     cards.append(card)
-                
+
                 self.logger.info(f"Loaded {len(cards)} existing cards from database")
                 return cards
         except psycopg2.Error as e:
             self.logger.error(f"Failed to load cards from database: {e}")
+            return []
+
+    def delete_cards_by_ids(self, card_ids: List[str]) -> int:
+        """Delete cards from database by their IDs"""
+        if not card_ids:
+            return 0
+
+        try:
+            deleted_count = 0
+            with self.connection.cursor() as cursor:
+                delete_duplicates_query = """
+                DELETE FROM duplicates 
+                WHERE original_card_id = ANY(%s) OR duplicate_card_id = ANY(%s)
+                """
+                cursor.execute(delete_duplicates_query, (card_ids, card_ids))
+
+                delete_cards_query = """
+                DELETE FROM debate_cards 
+                WHERE card_id = ANY(%s)
+                """
+                cursor.execute(delete_cards_query, (card_ids,))
+                deleted_count = cursor.rowcount
+
+                self.connection.commit()
+                self.logger.info(
+                    f"Successfully deleted {deleted_count} cards from database"
+                )
+                return deleted_count
+        except psycopg2.Error as e:
+            self.logger.error(f"Failed to delete cards from database: {e}")
+            self.connection.rollback()
+            return 0
+
+    def get_duplicate_records(self) -> List[dict]:
+        """Get all duplicate records from the duplicates table"""
+        try:
+            with self.connection.cursor() as cursor:
+                cursor.execute("""
+                    SELECT original_card_id, duplicate_card_id, similarity_score, detection_method
+                    FROM duplicates
+                    ORDER BY similarity_score DESC
+                """)
+                rows = cursor.fetchall()
+
+                duplicates = []
+                for row in rows:
+                    duplicates.append(
+                        {
+                            "original_card_id": row["original_card_id"],
+                            "duplicate_card_id": row["duplicate_card_id"],
+                            "similarity_score": row["similarity_score"],
+                            "detection_method": row["detection_method"],
+                        }
+                    )
+
+                return duplicates
+        except psycopg2.Error as e:
+            self.logger.error(f"Failed to get duplicate records: {e}")
             return []
 
 
@@ -292,4 +398,3 @@ def create_database_handler(
             return None
     else:
         return None
-

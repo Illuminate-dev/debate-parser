@@ -82,6 +82,10 @@ class CitationParser:
                 if words:
                     result["credits"] = words[-1]
 
+        if len(result["credits"]) > 12:
+            words = citation_text.split()
+            if words:
+                result["credits"] = words[-1]
         result["cite"] = result["author_surname"] + " " + result["author_year"]
 
         return result

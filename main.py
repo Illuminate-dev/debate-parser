@@ -39,7 +39,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
-    arg_parser.add_argument("input_file", help="Input file (.zip or .docx)")
+    arg_parser.add_argument("input_file", nargs="?", help="Input file (.zip or .docx)")
 
     # Debug options
     debug_group = arg_parser.add_argument_group("debug options")
@@ -84,8 +84,50 @@ def main():
         "--db-password",
         help="PostgreSQL database password",
     )
+    db_group.add_argument(
+        "--clear-duplicates",
+        action="store_true",
+        help="Clear duplicate cards from the database using duplicate detection",
+    )
 
     args = arg_parser.parse_args()
+
+    if args.clear_duplicates:
+        if not (args.db_host and args.db_name and args.db_user):
+            print(
+                "Error: Database connection parameters required for --clear-duplicates"
+            )
+            print("Required: --db-host, --db-name, --db-user")
+            sys.exit(1)
+
+        password = args.db_password or ""
+        database_handler = create_database_handler(
+            host=args.db_host,
+            port=args.db_port,
+            database=args.db_name,
+            user=args.db_user,
+            password=password,
+        )
+
+        if not database_handler:
+            print("Failed to connect to database")
+            sys.exit(1)
+
+        print(f"Connected to database: {args.db_name}")
+
+        from src.document_parser import DebateCardParser
+
+        parser = DebateCardParser(database_handler=database_handler)
+        cleared_count = parser.clear_database_duplicates()
+
+        print(f"Cleared {cleared_count} duplicate cards from database")
+        database_handler.disconnect()
+        return
+
+    if not args.input_file:
+        print("Error: input_file is required when not using --clear-duplicates")
+        arg_parser.print_help()
+        sys.exit(1)
 
     input_path = args.input_file
 

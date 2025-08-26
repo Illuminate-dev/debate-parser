@@ -89,7 +89,7 @@ class HTMLFormatter:
                         6: "#FF00FF",  # Magenta
                         7: "#0000FF",  # Blue
                     }
-                    bg_color = color_map.get(highlight, "#FFFF00")
+                    bg_color = color_map.get(3)  # only use turquoise
                     tags.append(f'<mark style="background-color: {bg_color};">')
                     close_tags.insert(0, "</mark>")
 
@@ -226,7 +226,6 @@ class HTMLFormatter:
                     print("    XML parsing failed")
             print()
 
-    # Also method to specifically handle citation formatting
     def extract_citation_with_enhanced_formatting(
         self, citation_para
     ) -> tuple[str, str]:
@@ -240,13 +239,3 @@ class HTMLFormatter:
         )
 
         return citation_raw, citation_html
-
-    def extract_highlighted_text(self, paragraph) -> str:
-        """Extract only the highlighted text from a paragraph"""
-        highlighted_parts = []
-
-        for run in paragraph.runs:
-            if run._element.rPr is not None and run._element.rPr.highlight_val:
-                highlighted_parts.append(run.text)
-
-        return " ".join(highlighted_parts)

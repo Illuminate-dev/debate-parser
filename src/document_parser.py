@@ -47,6 +47,36 @@ class DebateCardParser:
         self.html_formatter = HTMLFormatter()
         self.citation_parser = CitationParser()
 
+        # Track if we've loaded existing cards from database
+        self._database_cards_loaded = False
+
+    def _load_existing_cards_for_duplicate_detection(self) -> None:
+        """Load existing cards from database and add them to duplicate detector"""
+        if not self.database_handler or self.skip_duplicates:
+            return
+
+        try:
+            existing_cards = self.database_handler.get_all_cards()
+            if existing_cards:
+                print(
+                    f"Loading {len(existing_cards)} existing cards from database for duplicate detection..."
+                )
+
+                for card in existing_cards:
+                    content_key = f"{card.tagline} {card.author_surname} {card.author_year} {card.body_text}"
+                    content_id = (
+                        f"{card.author_surname}_{card.author_year}_{card.card_id}"
+                    )
+                    self.duplicate_detector.add(content_key, content_id)
+
+                print(
+                    f"Loaded {len(existing_cards)} existing cards into duplicate detector"
+                )
+        except Exception as e:
+            print(
+                f"Warning: Failed to load existing cards for duplicate detection: {e}"
+            )
+
     def _save_cards_to_database(self, cards: List[DebateCard]) -> None:
         """Save cards to database"""
         if self.database_handler and cards:
@@ -186,6 +216,11 @@ class DebateCardParser:
         body_paras = []
         body_html_parts = []
         highlighted_parts = []
+
+        # If the first paragraph is empty, skip initial paragraph
+        if not doc.paragraphs[start_index].text.strip():
+            start_index += 1
+
         end_para = start_index
 
         for j in range(start_index, paragraph_count):
@@ -194,7 +229,7 @@ class DebateCardParser:
             # Stop at non-body paragraphs or empty paragraphs
             if (
                 para.style.name not in ["Normal", "List Paragraph"]
-                or not para.text.strip()
+                # or not para.text.strip()
             ):
                 end_para = j - 1
                 break
@@ -266,6 +301,11 @@ class DebateCardParser:
 
         if self.skip_duplicates:
             return False
+
+        # Load existing cards from database on first duplicate check
+        if not self._database_cards_loaded:
+            self._load_existing_cards_for_duplicate_detection()
+            self._database_cards_loaded = True
 
         content_key = f"{tagline} {author_surname} {author_year} {body_text}"
 
@@ -350,8 +390,25 @@ class DebateCardParser:
 
         print(f"Post-processing {len(self.parsed_cards)} cards for fuzzy duplicates...")
 
+        # Load existing cards from database if not already loaded
+        if not self._database_cards_loaded:
+            self._load_existing_cards_for_duplicate_detection()
+            self._database_cards_loaded = True
+
         # Create fresh MinHashLSH detector for fuzzy matching
         fuzzy_detector = DuplicateDetector()
+
+        # Load existing database cards into the fuzzy detector too
+        if self.database_handler and not self.skip_duplicates:
+            try:
+                existing_cards = self.database_handler.get_all_cards()
+                for card in existing_cards:
+                    content_key = f"{card.tagline} {card.author_surname} {card.author_year} {card.body_text}"
+                    fuzzy_detector.add(content_key, card.card_id)
+            except Exception as e:
+                print(
+                    f"Warning: Failed to load existing cards for fuzzy duplicate detection: {e}"
+                )
         fuzzy_duplicates = []
         unique_cards = []
 
@@ -679,3 +736,85 @@ class DebateCardParser:
 
         doc.save(output_path)
         print(f"Saved {len(self.malformed_cards)} malformed cards to {output_path}")
+
+    def clear_database_duplicates(self) -> int:
+        """Detect and remove duplicate cards from the database"""
+        if not self.database_handler:
+            print("Error: Database handler not available")
+            return 0
+
+        print("Loading cards from database for duplicate detection...")
+        all_cards = self.database_handler.get_all_cards()
+
+        if len(all_cards) < 2:
+            print("Not enough cards in database for duplicate detection")
+            return 0
+
+        print(f"Loaded {len(all_cards)} cards from database")
+        print("Running duplicate detection...")
+
+        duplicate_detector = DuplicateDetector()
+        duplicates_to_remove = []
+        unique_cards = []
+        content_to_card_id = {}  # Map content keys to card IDs for finding originals
+
+        for card in all_cards:
+            content_key = f"{card.tagline} {card.author_surname} {card.author_year} {card.body_text}"
+            card_info = {
+                "tagline": card.tagline,
+                "author_surname": card.author_surname,
+                "author_year": card.author_year,
+                "body_text": (
+                    card.body_text[:200] + "..."
+                    if len(card.body_text) > 200
+                    else card.body_text
+                ),
+                "source_filename": card.source_filename,
+                "card_id": card.card_id,
+            }
+
+            if duplicate_detector.check(content_key, card_info):
+                duplicates_to_remove.append(card.card_id)
+
+                original_card_id = content_to_card_id.get(content_key)
+                if original_card_id:
+                    similarity_score = 1.0
+                    detection_method = "hash_based"
+
+                    if (
+                        hasattr(duplicate_detector, "detected_duplicates")
+                        and duplicate_detector.detected_duplicates
+                    ):
+                        latest_duplicate = duplicate_detector.detected_duplicates[-1]
+                        similarity_score = latest_duplicate.get("similarity_score", 1.0)
+                        detection_method = latest_duplicate.get(
+                            "detection_method", "hash_based"
+                        )
+
+                    self.database_handler.save_duplicate_record(
+                        original_card_id,
+                        card.card_id,
+                        similarity_score,
+                        detection_method,
+                    )
+            else:
+                unique_cards.append(card)
+                content_to_card_id[content_key] = card.card_id
+                duplicate_detector.add(content_key, card.card_id)
+
+        if not duplicates_to_remove:
+            print("No duplicates found in database")
+            return 0
+
+        print(f"Found {len(duplicates_to_remove)} duplicate cards to remove")
+        print("Removing duplicate cards from database...")
+
+        deleted_count = self.database_handler.delete_cards_by_ids(duplicates_to_remove)
+
+        if deleted_count > 0:
+            print(f"Successfully removed {deleted_count} duplicate cards")
+            print(f"Remaining unique cards: {len(unique_cards)}")
+        else:
+            print("Failed to remove duplicate cards")
+
+        return deleted_count
