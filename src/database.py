@@ -83,10 +83,23 @@ class DatabaseHandler:
         );
         """
 
+        create_document_hashes_table = """
+        CREATE TABLE IF NOT EXISTS document_hashes (
+            id SERIAL PRIMARY KEY,
+            file_hash VARCHAR(64) UNIQUE NOT NULL,
+            filename VARCHAR(255) NOT NULL,
+            file_size BIGINT,
+            processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            card_count INTEGER DEFAULT 0,
+            malformed_count INTEGER DEFAULT 0
+        );
+        """
+
         try:
             with self.connection.cursor() as cursor:
                 cursor.execute(create_debate_cards_table)
                 cursor.execute(create_duplicates_table)
+                cursor.execute(create_document_hashes_table)
                 self.connection.commit()
                 self.logger.info("Database tables created successfully")
         except psycopg2.Error as e:
@@ -380,6 +393,68 @@ class DatabaseHandler:
         except psycopg2.Error as e:
             self.logger.error(f"Failed to get duplicate records: {e}")
             return []
+
+    def check_document_hash(self, file_hash: str) -> Optional[dict]:
+        """Check if a document hash already exists in the database"""
+        try:
+            with self.connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT file_hash, filename, file_size, processed_at, card_count, malformed_count
+                    FROM document_hashes
+                    WHERE file_hash = %s
+                """,
+                    (file_hash,),
+                )
+                row = cursor.fetchone()
+
+                if row:
+                    return {
+                        "file_hash": row["file_hash"],
+                        "filename": row["filename"],
+                        "file_size": row["file_size"],
+                        "processed_at": row["processed_at"],
+                        "card_count": row["card_count"],
+                        "malformed_count": row["malformed_count"],
+                    }
+                return None
+        except psycopg2.Error as e:
+            self.logger.error(f"Failed to check document hash: {e}")
+            return None
+
+    def save_document_hash(
+        self,
+        file_hash: str,
+        filename: str,
+        file_size: int,
+        card_count: int = 0,
+        malformed_count: int = 0,
+    ) -> bool:
+        """Save a document hash record to the database"""
+        insert_query = """
+        INSERT INTO document_hashes (file_hash, filename, file_size, card_count, malformed_count)
+        VALUES (%s, %s, %s, %s, %s)
+        ON CONFLICT (file_hash) DO UPDATE SET
+            filename = EXCLUDED.filename,
+            file_size = EXCLUDED.file_size,
+            card_count = EXCLUDED.card_count,
+            malformed_count = EXCLUDED.malformed_count,
+            processed_at = CURRENT_TIMESTAMP;
+        """
+
+        try:
+            with self.connection.cursor() as cursor:
+                cursor.execute(
+                    insert_query,
+                    (file_hash, filename, file_size, card_count, malformed_count),
+                )
+                self.connection.commit()
+                self.logger.info(f"Saved document hash for {filename}")
+                return True
+        except psycopg2.Error as e:
+            self.logger.error(f"Failed to save document hash: {e}")
+            self.connection.rollback()
+            return False
 
 
 def create_database_handler(

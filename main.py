@@ -89,6 +89,11 @@ def main():
         action="store_true",
         help="Clear duplicate cards from the database using duplicate detection",
     )
+    db_group.add_argument(
+        "--force-reprocess",
+        action="store_true",
+        help="Force reprocessing of documents even if they've been processed before",
+    )
 
     args = arg_parser.parse_args()
 
@@ -114,9 +119,6 @@ def main():
             sys.exit(1)
 
         print(f"Connected to database: {args.db_name}")
-
-        from src.document_parser import DebateCardParser
-
         parser = DebateCardParser(database_handler=database_handler)
         cleared_count = parser.clear_database_duplicates()
 
@@ -153,6 +155,7 @@ def main():
         skip_duplicates=args.skip_duplicates,
         testing_mode=args.testing_mode,
         database_handler=database_handler,
+        force_reprocess=args.force_reprocess,
     )
 
     print(f"Starting to parse {input_path}...")

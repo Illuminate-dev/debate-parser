@@ -13,6 +13,7 @@ from datasketch import MinHash
 
 from .citation_parser import CitationParser
 from .duplicate_detector import DuplicateDetector, FastDuplicateDetector
+from .file_hasher import compute_file_hash, get_file_size
 from .html_formatter import HTMLFormatter
 from .models import DebateCard
 
@@ -30,6 +31,7 @@ class DebateCardParser:
         skip_duplicates: bool = False,
         testing_mode: bool = False,
         database_handler=None,
+        force_reprocess: bool = False,
     ):
         self.parsed_cards = []
         self.malformed_cards = []
@@ -37,6 +39,7 @@ class DebateCardParser:
         self.skip_duplicates = skip_duplicates
         self.testing_mode = testing_mode
         self.database_handler = database_handler
+        self.force_reprocess = force_reprocess
 
         self.duplicate_detector = DuplicateDetector()
         self.is_worker_process = False  # Track if this is a worker process
@@ -457,16 +460,79 @@ class DebateCardParser:
                 f"Total duplicates detected: {len(all_duplicates)} (exact: {len(self._worker_exact_duplicates)}, fuzzy: {len(fuzzy_duplicates)})"
             )
 
+    def _check_document_processed(
+        self, file_path: str, file_data: bytes = None
+    ) -> bool:
+        """Check if document has already been processed based on hash"""
+        if not self.database_handler or self.force_reprocess:
+            return False
+
+        try:
+            if file_data:
+                file_hash = compute_file_hash(file_data)
+                file_size = len(file_data)
+            else:
+                file_hash = compute_file_hash(file_path)
+                file_size = get_file_size(file_path)
+
+            existing_record = self.database_handler.check_document_hash(file_hash)
+            if existing_record:
+                print(f"Skipping {Path(file_path).name}")
+                return True
+
+            return False
+        except Exception as e:
+            print(f"Warning: Failed to check document hash for {file_path}: {e}")
+            return False
+
+    def _save_document_hash(
+        self,
+        file_path: str,
+        file_data: bytes = None,
+        card_count: int = 0,
+        malformed_count: int = 0,
+    ) -> None:
+        """Save document hash after successful processing"""
+        if not self.database_handler:
+            return
+
+        try:
+            filename = Path(file_path).name
+            if file_data:
+                file_hash = compute_file_hash(file_data)
+                file_size = len(file_data)
+            else:
+                file_hash = compute_file_hash(file_path)
+                file_size = get_file_size(file_path)
+
+            self.database_handler.save_document_hash(
+                file_hash, filename, file_size, card_count, malformed_count
+            )
+        except Exception as e:
+            print(f"Warning: Failed to save document hash for {file_path}: {e}")
+
     def parse_single_docx(self, docx_path: str) -> None:
         """Parse a single .docx file"""
         filename = Path(docx_path).name
         print(f"Parsing single document: {filename}")
+
+        # Check if document was already processed
+        if self._check_document_processed(docx_path):
+            return
 
         try:
             with open(docx_path, "rb") as docx_file:
                 cards = self.parse_docx(docx_file, filename)
                 self.parsed_cards.extend(cards)
                 self._save_cards_to_database(cards)
+
+                malformed_count = len(
+                    [m for m in self.malformed_cards if m["filename"] == filename]
+                )
+                self._save_document_hash(
+                    docx_path, card_count=len(cards), malformed_count=malformed_count
+                )
+
                 print(f"Found {len(cards)} cards in {filename}")
         except Exception as e:
             print(f"Error processing {filename}: {e}")
@@ -499,8 +565,35 @@ class DebateCardParser:
                     for file_info in docx_files:
                         try:
                             with zf.open(file_info.filename) as docx_file:
-                                cards = self.parse_docx(docx_file, file_info.filename)
-                                self.parsed_cards.extend(cards)
+                                file_data = docx_file.read()
+
+                            if self._check_document_processed(
+                                file_info.filename, file_data
+                            ):
+                                bar()
+                                continue
+
+                            cards = self.parse_docx(
+                                BytesIO(file_data), file_info.filename
+                            )
+                            self.parsed_cards.extend(cards)
+
+                            malformed_count = len(
+                                [
+                                    m
+                                    for m in self.malformed_cards
+                                    if m["filename"] == file_info.filename
+                                ]
+                            )
+                            self._save_document_hash(
+                                file_info.filename,
+                                file_data,
+                                card_count=len(cards),
+                                malformed_count=malformed_count,
+                            )
+
+                        except SkipFileException as e:
+                            print(f"Skipped file: {e}")
                         except Exception as e:
                             print(f"Error processing {file_info.filename}: {e}")
                         bar()
@@ -513,7 +606,12 @@ class DebateCardParser:
                 temp_files = []
                 for file_info in docx_files:
                     with zf.open(file_info.filename) as docx_file:
-                        temp_files.append((docx_file.read(), file_info.filename))
+                        file_data = docx_file.read()
+
+                    if self._check_document_processed(file_info.filename, file_data):
+                        continue
+
+                    temp_files.append((file_data, file_info.filename))
 
                 with ProcessPoolExecutor(max_workers=max_workers) as executor:
                     with alive_bar(
@@ -530,6 +628,8 @@ class DebateCardParser:
                         }
 
                         worker_exact_duplicates = []
+                        processed_files = []
+
                         for future in as_completed(future_to_file):
                             filename = future_to_file[future]
                             try:
@@ -537,9 +637,27 @@ class DebateCardParser:
                                 self.parsed_cards.extend(cards)
                                 self.malformed_cards.extend(malformed)
                                 worker_exact_duplicates.extend(exact_duplicates)
+
+                                processed_files.append(
+                                    (filename, len(cards), len(malformed))
+                                )
                             except Exception as e:
                                 print(f"Error processing {filename}: {e}")
                             bar()
+
+                        for filename, card_count, malformed_count in processed_files:
+                            file_data = next(
+                                (
+                                    data
+                                    for data, fname in temp_files
+                                    if fname == filename
+                                ),
+                                None,
+                            )
+                            if file_data:
+                                self._save_document_hash(
+                                    filename, file_data, card_count, malformed_count
+                                )
 
                 # Store exact duplicates found by workers
                 self._worker_exact_duplicates = worker_exact_duplicates
