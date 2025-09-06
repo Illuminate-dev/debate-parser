@@ -1,0 +1,231 @@
+// Package internal provides utilities for reading docx files into a manageable format
+package internal
+
+import (
+	"archive/zip"
+	"bytes"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+
+	"github.com/fumiama/go-docx"
+	"github.com/schollz/progressbar/v3"
+	"github.com/sirupsen/logrus"
+)
+
+type Parser struct {
+	Cards   []Card
+	Storage CardStorage
+}
+
+func NewParser(storage CardStorage) *Parser {
+	return &Parser{
+		Cards:   make([]Card, 0),
+		Storage: storage,
+	}
+}
+
+func (p *Parser) parseDocx(doc *docx.Docx, sourceFile string) {
+	totalItems := len(doc.Document.Body.Items)
+	logrus.WithFields(logrus.Fields{
+		"file":       sourceFile,
+		"paragraphs": totalItems,
+	}).Debug("Starting document parsing")
+
+	i := 0
+	cardsFound := 0
+	malformedCount := 0
+
+	for i < totalItems {
+
+		card, endIdx, err := ParseCard(doc.Document.Body.Items[i:])
+		switch err {
+		case nil:
+			card.SourceFilename = filepath.Base(sourceFile)
+			card.ParagraphStart = i
+			card.ParagraphEnd = i + endIdx - 1
+			p.Cards = append(p.Cards, card)
+			cardsFound++
+			i += endIdx
+			logrus.WithFields(logrus.Fields{
+				"card_id": card.CardID,
+				"tagline": card.Tagline[:min(50, len(card.Tagline))],
+			}).Debug("Parsed card")
+		case ErrNotCitation:
+			logrus.WithFields(logrus.Fields{
+				"paragraph": i,
+				"error":     err.Error(),
+			}).Debug("Malformed citation encountered")
+			malformedCount++
+			i += 1
+		default:
+			logrus.WithFields(logrus.Fields{
+				"paragraph": i,
+				"error":     err.Error(),
+			}).Debug("Skipping paragraph")
+			i += 1
+			continue
+		}
+	}
+
+	logrus.WithFields(logrus.Fields{
+		"file":            sourceFile,
+		"cards_found":     cardsFound,
+		"malformed":       malformedCount,
+		"total_processed": totalItems,
+	}).Debug("Document parsing completed")
+}
+
+func (p *Parser) ParseDocx(path string) error {
+	if filepath.Ext(path) != ".docx" {
+		return fmt.Errorf("path is not a .docx file")
+	}
+
+	readFile, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer readFile.Close()
+
+	fileinfo, err := readFile.Stat()
+	if err != nil {
+		return err
+	}
+	size := fileinfo.Size()
+	doc, err := docx.Parse(readFile, size)
+	if err != nil {
+		return err
+	}
+
+	p.parseDocx(doc, filepath.Base(path))
+	return nil
+}
+
+func (p *Parser) ParseZip(path string) error {
+	if filepath.Ext(path) != ".zip" {
+		return fmt.Errorf("path is not a .zip file")
+	}
+
+	reader, err := zip.OpenReader(path)
+	if err != nil {
+		logrus.WithError(err).WithField("path", path).Error("Failed to open ZIP file")
+		return err
+	}
+	defer reader.Close()
+
+	// Count DOCX files first
+	docxFiles := make([]*zip.File, 0)
+	for _, file := range reader.File {
+		if filepath.Ext(file.Name) == ".docx" {
+			docxFiles = append(docxFiles, file)
+		}
+	}
+
+	logrus.WithFields(logrus.Fields{
+		"zip_file":    filepath.Base(path),
+		"total_files": len(reader.File),
+		"docx_files":  len(docxFiles),
+	}).Info("Processing ZIP archive")
+
+	bar := progressbar.NewOptions(len(docxFiles),
+		progressbar.OptionSetDescription("Processing DOCX files"),
+		progressbar.OptionShowCount(),
+		progressbar.OptionSetWidth(50),
+	)
+
+	successCount := 0
+	errorCount := 0
+
+	for i, file := range docxFiles {
+		bar.Set(i)
+
+		logrus.WithField("file", file.Name).Debug("Processing DOCX file")
+
+		r, err := file.Open()
+		if err != nil {
+			logrus.WithError(err).WithField("file", file.Name).Warn("Failed to open DOCX file")
+			errorCount++
+			continue
+		}
+
+		content, err := io.ReadAll(r)
+		r.Close()
+		if err != nil {
+			logrus.WithError(err).WithField("file", file.Name).Warn("Failed to read DOCX file")
+			errorCount++
+			continue
+		}
+
+		readerAt := bytes.NewReader(content)
+
+		doc, err := docx.Parse(readerAt, int64(len(content)))
+		if err != nil {
+			logrus.WithError(err).WithField("file", file.Name).Warn("Failed to parse DOCX file")
+			errorCount++
+			continue
+		}
+
+		p.parseDocx(doc, file.Name)
+		successCount++
+	}
+
+	bar.Finish()
+
+	logrus.WithFields(logrus.Fields{
+		"zip_file":    filepath.Base(path),
+		"processed":   successCount,
+		"errors":      errorCount,
+		"total_cards": len(p.Cards),
+	}).Info("ZIP archive processing completed")
+
+	return nil
+}
+
+func (p *Parser) Save() error {
+	return p.Storage.Save(p.Cards)
+}
+
+func (p *Parser) RemoveDuplicates() error {
+	return p.Storage.PruneDupes()
+}
+
+func (p *Parser) reportDocx(path string) error {
+	if filepath.Ext(path) != ".docx" {
+		return fmt.Errorf("path is not a .docx file")
+	}
+
+	readFile, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer readFile.Close()
+
+	fileinfo, err := readFile.Stat()
+	if err != nil {
+		return err
+	}
+	size := fileinfo.Size()
+	doc, err := docx.Parse(readFile, size)
+	if err != nil {
+		return err
+	}
+
+	i := 0
+	for i < len(doc.Document.Body.Items) {
+		switch v := doc.Document.Body.Items[i].(type) {
+		case *docx.Paragraph:
+			fmt.Printf("%v: %v\n", getStyle(v), v.String()[:min(len(v.String()), 50)])
+		}
+		i++
+	}
+
+	return nil
+}
+
+func getStyle(para *docx.Paragraph) string {
+	if para.Properties != nil && para.Properties.Style != nil {
+		return para.Properties.Style.Val
+	}
+	return ""
+}
