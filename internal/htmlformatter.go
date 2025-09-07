@@ -59,7 +59,7 @@ func runToHTML(run *docx.Run) string {
 			tags = append(tags, tagHTML{"em", ""})
 		}
 
-		if props.Underline != nil {
+		if isUnderline(props) {
 			tags = append(tags, tagHTML{"u", ""})
 		}
 
@@ -169,5 +169,18 @@ func extractHighlightedText(para *docx.Paragraph) string {
 }
 
 func isBold(props *docx.RunProperties) bool {
-	return props.Bold != nil || (props.RunStyle != nil && strings.Contains(strings.ToLower(props.RunStyle.Val), "bold"))
+	if props.Bold != nil {
+		return true
+	}
+	if props.RunStyle != nil {
+		styleLower := strings.ToLower(props.RunStyle.Val)
+		return strings.Contains(styleLower, "bold") || 
+			   strings.Contains(styleLower, "emphasis") || 
+			   strings.Contains(styleLower, "strong")
+	}
+	return false
+}
+
+func isUnderline(props *docx.RunProperties) bool {
+	return props.Underline != nil || (props.RunStyle != nil && strings.Contains(strings.ToLower(props.RunStyle.Val), "underline"))
 }
