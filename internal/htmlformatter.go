@@ -40,7 +40,7 @@ func paraToHTML(para *docx.Paragraph) string {
 	}
 
 	for _, tag := range tags {
-		paraString.WriteString(fmt.Sprintf("<%v>", tag.Name))
+		paraString.WriteString(fmt.Sprintf("</%v>", tag.Name))
 	}
 
 	return paraString.String()
