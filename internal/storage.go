@@ -337,6 +337,7 @@ func NewPostgresStorage(url string) (*PostgresStorage, error) {
 		return nil, err
 	}
 
+	// Create tables following the Prisma schema
 	createCardsTabelQuery := `
 CREATE TABLE IF NOT EXISTS debate_cards (
             id SERIAL PRIMARY KEY,
@@ -366,10 +367,23 @@ CREATE TABLE IF NOT EXISTS debate_cards (
         );
 	`
 
-	// Add tags column if it doesn't exist
-	addTagsColumnQuery := `
-ALTER TABLE debate_cards 
-ADD COLUMN IF NOT EXISTS tags TEXT[] DEFAULT '{}';
+	createTagsTableQuery := `
+CREATE TABLE IF NOT EXISTS tags (
+            id SERIAL PRIMARY KEY,
+            name VARCHAR(50) UNIQUE NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+CREATE INDEX IF NOT EXISTS idx_tags_name ON tags(name);
+	`
+
+	createDebateCardsTagsTableQuery := `
+CREATE TABLE IF NOT EXISTS debate_cards_tags (
+            id SERIAL PRIMARY KEY,
+            card_id INTEGER REFERENCES debate_cards(id) ON DELETE CASCADE,
+            tag_id INTEGER REFERENCES tags(id) ON DELETE CASCADE,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(card_id, tag_id)
+        );
 	`
 
 	_, err = conn.Exec(context.Background(), createCardsTabelQuery)
@@ -377,7 +391,12 @@ ADD COLUMN IF NOT EXISTS tags TEXT[] DEFAULT '{}';
 		return nil, err
 	}
 
-	_, err = conn.Exec(context.Background(), addTagsColumnQuery)
+	_, err = conn.Exec(context.Background(), createTagsTableQuery)
+	if err != nil {
+		return nil, err
+	}
+
+	_, err = conn.Exec(context.Background(), createDebateCardsTagsTableQuery)
 	if err != nil {
 		return nil, err
 	}
@@ -404,13 +423,12 @@ func (p *PostgresStorage) scanCards(rows pgx.Rows) ([]Card, error) {
 	return cards, nil
 }
 
-// Helper function to scan a single row into a Card
+// Helper function to scan a single row into a Card (without tags)
 func (p *PostgresStorage) scanCard(scanner interface {
 	Scan(dest ...any) error
 }, card *Card,
 ) error {
 	var createdAt time.Time
-	var tags []string
 	err := scanner.Scan(
 		&card.CardID,
 		&card.Tagline,
@@ -434,7 +452,6 @@ func (p *PostgresStorage) scanCard(scanner interface {
 		&card.WordCount,
 		&card.HighlightCount,
 		&createdAt,
-		&tags,
 	)
 	if err != nil {
 		return err
@@ -442,7 +459,6 @@ func (p *PostgresStorage) scanCard(scanner interface {
 
 	// Convert time.Time to string format matching the Card struct
 	card.CreatedAt = createdAt.Format("2006-01-02 15:04:05.000000")
-	card.Tags = tags
 	return nil
 }
 
@@ -459,9 +475,9 @@ func (p *PostgresStorage) Save(cards []Card) error {
             author_surname, author_year, author_credentials, publication_title,
             publisher, url, credits, body_text, body_html, highlighted_text,
             source_filename, paragraph_start, paragraph_end, word_count,
-            highlight_count, created_at, tags
+            highlight_count, created_at
         ) VALUES (
-  					$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23
+  					$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22
         ) ON CONFLICT (card_id) DO NOTHING;`
 
 	batch := &pgx.Batch{}
@@ -544,7 +560,6 @@ func (p *PostgresStorage) Save(cards []Card) error {
 			card.WordCount,
 			card.HighlightCount,
 			card.CreatedAt,
-			card.Tags,
 		)
 	}
 
@@ -553,6 +568,7 @@ func (p *PostgresStorage) Save(cards []Card) error {
 
 	savedCount := 0
 	errorCount := 0
+	savedCards := make([]Card, 0)
 
 	for i := range cards {
 		res, err := results.Exec()
@@ -564,6 +580,15 @@ func (p *PostgresStorage) Save(cards []Card) error {
 
 		if res.RowsAffected() > 0 {
 			savedCount++
+			savedCards = append(savedCards, cards[i])
+		}
+	}
+
+	// Now handle tags for saved cards
+	if len(savedCards) > 0 {
+		err := p.saveTags(savedCards)
+		if err != nil {
+			logrus.WithError(err).Warn("Error saving tags")
 		}
 	}
 
@@ -577,13 +602,153 @@ func (p *PostgresStorage) Save(cards []Card) error {
 	return nil
 }
 
+// saveTags inserts tags and creates many-to-many relationships for cards
+func (p *PostgresStorage) saveTags(cards []Card) error {
+	// Collect all unique tags
+	allTags := make(map[string]bool)
+	for _, card := range cards {
+		for _, tag := range card.Tags {
+			if tag != "" {
+				allTags[tag] = true
+			}
+		}
+	}
+
+	if len(allTags) == 0 {
+		return nil
+	}
+
+	// Insert tags (ignore conflicts)
+	insertTagQuery := `INSERT INTO tags (name) VALUES ($1) ON CONFLICT (name) DO NOTHING`
+	batch := &pgx.Batch{}
+
+	for tag := range allTags {
+		batch.Queue(insertTagQuery, tag)
+	}
+
+	results := p.connection.SendBatch(context.Background(), batch)
+	// Properly drain all results from the batch
+	for i := 0; i < len(allTags); i++ {
+		_, err := results.Exec()
+		if err != nil {
+			logrus.WithError(err).Warn("Error inserting tag")
+		}
+	}
+	results.Close()
+
+	// Get tag IDs for all tags
+	tagIDs, err := p.getTagIDs(allTags)
+	if err != nil {
+		return fmt.Errorf("failed to get tag IDs: %w", err)
+	}
+
+	// Insert card-tag relationships
+	return p.insertCardTagRelationships(cards, tagIDs)
+}
+
+// getTagIDs retrieves tag IDs for given tag names
+func (p *PostgresStorage) getTagIDs(tags map[string]bool) (map[string]int, error) {
+	tagNames := make([]string, 0, len(tags))
+	for tag := range tags {
+		tagNames = append(tagNames, tag)
+	}
+
+	query := `SELECT id, name FROM tags WHERE name = ANY($1)`
+	rows, err := p.connection.Query(context.Background(), query, tagNames)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	tagIDs := make(map[string]int)
+	for rows.Next() {
+		var id int
+		var name string
+		if err := rows.Scan(&id, &name); err != nil {
+			return nil, err
+		}
+		tagIDs[name] = id
+	}
+
+	return tagIDs, rows.Err()
+}
+
+// insertCardTagRelationships creates many-to-many relationships between cards and tags
+func (p *PostgresStorage) insertCardTagRelationships(cards []Card, tagIDs map[string]int) error {
+	// First, get card database IDs from card_id
+	cardDBIDs, err := p.getCardDBIDs(cards)
+	if err != nil {
+		return fmt.Errorf("failed to get card database IDs: %w", err)
+	}
+
+	insertRelQuery := `INSERT INTO debate_cards_tags (card_id, tag_id) VALUES ($1, $2) ON CONFLICT (card_id, tag_id) DO NOTHING`
+	batch := &pgx.Batch{}
+
+	for _, card := range cards {
+		cardDBID, exists := cardDBIDs[card.CardID]
+		if !exists {
+			continue
+		}
+
+		for _, tag := range card.Tags {
+			tagID, exists := tagIDs[tag]
+			if exists && tag != "" {
+				batch.Queue(insertRelQuery, cardDBID, tagID)
+			}
+		}
+	}
+
+	if batch.Len() == 0 {
+		return nil
+	}
+
+	results := p.connection.SendBatch(context.Background(), batch)
+	// Properly drain all results from the batch
+	for i := 0; i < batch.Len(); i++ {
+		_, err := results.Exec()
+		if err != nil {
+			logrus.WithError(err).Warn("Error inserting card-tag relationship")
+		}
+	}
+	results.Close()
+
+	return nil
+}
+
+// getCardDBIDs retrieves database IDs for cards based on their card_id
+func (p *PostgresStorage) getCardDBIDs(cards []Card) (map[string]int, error) {
+	cardIDs := make([]string, len(cards))
+	for i, card := range cards {
+		cardIDs[i] = card.CardID
+	}
+
+	query := `SELECT id, card_id FROM debate_cards WHERE card_id = ANY($1)`
+	rows, err := p.connection.Query(context.Background(), query, cardIDs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	cardDBIDs := make(map[string]int)
+	for rows.Next() {
+		var dbID int
+		var cardID string
+		if err := rows.Scan(&dbID, &cardID); err != nil {
+			return nil, err
+		}
+		cardDBIDs[cardID] = dbID
+	}
+
+	return cardDBIDs, rows.Err()
+}
+
 func (p *PostgresStorage) Load() ([]Card, error) {
 	query := `SELECT 
 		card_id, tagline, tagline_html, citation_raw, citation_html, cite,
 		author_surname, author_year, author_credentials, publication_title,
 		publisher, url, credits, body_text, body_html, highlighted_text,
 		source_filename, paragraph_start, paragraph_end, word_count,
-		highlight_count, created_at, tags
+		highlight_count, created_at
 	FROM debate_cards
 	ORDER BY created_at DESC`
 
@@ -593,7 +758,66 @@ func (p *PostgresStorage) Load() ([]Card, error) {
 	}
 	defer rows.Close()
 
-	return p.scanCards(rows)
+	cards, err := p.scanCards(rows)
+	if err != nil {
+		return nil, err
+	}
+
+	// Load tags for all cards
+	err = p.loadTagsForCards(cards)
+	if err != nil {
+		logrus.WithError(err).Warn("Failed to load tags for cards")
+	}
+
+	return cards, nil
+}
+
+// loadTagsForCards loads tags for all cards using the junction table
+func (p *PostgresStorage) loadTagsForCards(cards []Card) error {
+	if len(cards) == 0 {
+		return nil
+	}
+
+	cardIDs := make([]string, len(cards))
+	for i, card := range cards {
+		cardIDs[i] = card.CardID
+	}
+
+	query := `
+		SELECT dc.card_id, t.name
+		FROM debate_cards dc
+		JOIN debate_cards_tags dct ON dc.id = dct.card_id
+		JOIN tags t ON dct.tag_id = t.id
+		WHERE dc.card_id = ANY($1)
+		ORDER BY dc.card_id, t.name
+	`
+
+	rows, err := p.connection.Query(context.Background(), query, cardIDs)
+	if err != nil {
+		return fmt.Errorf("failed to query card tags: %w", err)
+	}
+	defer rows.Close()
+
+	// Create a map to group tags by card_id
+	cardTags := make(map[string][]string)
+	for rows.Next() {
+		var cardID, tagName string
+		if err := rows.Scan(&cardID, &tagName); err != nil {
+			return err
+		}
+		cardTags[cardID] = append(cardTags[cardID], tagName)
+	}
+
+	// Assign tags to cards
+	for i := range cards {
+		if tags, exists := cardTags[cards[i].CardID]; exists {
+			cards[i].Tags = tags
+		} else {
+			cards[i].Tags = []string{}
+		}
+	}
+
+	return rows.Err()
 }
 
 func (p *PostgresStorage) deleteIDs(ids []string) error {
@@ -708,33 +932,43 @@ func (p *PostgresStorage) UpdateTags(cards []Card) error {
 
 	logrus.WithField("card_count", len(cards)).Info("Updating card tags in database")
 
-	updateQuery := `UPDATE debate_cards SET tags = $2 WHERE card_id = $1`
-	batch := &pgx.Batch{}
-
-	for _, card := range cards {
-		batch.Queue(updateQuery, card.CardID, card.Tags)
+	// Get card database IDs
+	cardDBIDs, err := p.getCardDBIDs(cards)
+	if err != nil {
+		return fmt.Errorf("failed to get card database IDs: %w", err)
 	}
-
-	results := p.connection.SendBatch(context.Background(), batch)
-	defer results.Close()
 
 	updatedCount := 0
 	errorCount := 0
 
-	for i := range cards {
-		res, err := results.Exec()
-		if err != nil {
-			logrus.WithError(err).WithFields(logrus.Fields{
-				"card_index": i,
-				"card_id":    cards[i].CardID,
-			}).Warn("Error updating card tags")
+	for _, card := range cards {
+		cardDBID, exists := cardDBIDs[card.CardID]
+		if !exists {
+			logrus.WithField("card_id", card.CardID).Warn("Card not found in database")
 			errorCount++
 			continue
 		}
 
-		if res.RowsAffected() > 0 {
-			updatedCount++
+		// Delete existing tag relationships for this card
+		deleteQuery := `DELETE FROM debate_cards_tags WHERE card_id = $1`
+		_, err := p.connection.Exec(context.Background(), deleteQuery, cardDBID)
+		if err != nil {
+			logrus.WithError(err).WithField("card_id", card.CardID).Warn("Error deleting existing card tags")
+			errorCount++
+			continue
 		}
+
+		// Insert new tag relationships if there are tags
+		if len(card.Tags) > 0 {
+			err = p.saveTags([]Card{card})
+			if err != nil {
+				logrus.WithError(err).WithField("card_id", card.CardID).Warn("Error saving updated card tags")
+				errorCount++
+				continue
+			}
+		}
+
+		updatedCount++
 	}
 
 	logrus.WithFields(logrus.Fields{
