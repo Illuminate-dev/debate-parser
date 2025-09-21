@@ -37,6 +37,7 @@ type Card struct {
 	SourceFilename string
 	ParagraphStart int
 	ParagraphEnd   int
+	Tags           []string // New field for tags
 }
 
 var (

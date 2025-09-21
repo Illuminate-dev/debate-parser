@@ -186,6 +186,10 @@ func (p *Parser) Save() error {
 	return p.Storage.Save(p.Cards)
 }
 
+func (p *Parser) GetCards() []Card {
+	return p.Cards
+}
+
 func (p *Parser) RemoveDuplicates() error {
 	return p.Storage.PruneDupes()
 }

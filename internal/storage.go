@@ -17,11 +17,13 @@ import (
 
 type CardStorage interface {
 	Save(cards []Card) error
+	Load() ([]Card, error)
+	UpdateTags(cards []Card) error
 	PruneDupes() error
 	Close() error
 }
 
-var CSVHeaders = []string{"CardID", "Tagline", "TaglineHTML", "Citation", "CitationHTML", "Cite", "AuthorSurname", "AuthorYear", "AuthorCreds", "PublicationTitle", "Publisher", "URL", "Credits", "Body", "BodyHTML", "HighlightCount", "HighlightedText", "WordCount", "CreatedAt", "SourceFilename"}
+var CSVHeaders = []string{"CardID", "Tagline", "TaglineHTML", "Citation", "CitationHTML", "Cite", "AuthorSurname", "AuthorYear", "AuthorCreds", "PublicationTitle", "Publisher", "URL", "Credits", "Body", "BodyHTML", "HighlightCount", "HighlightedText", "WordCount", "CreatedAt", "SourceFilename", "Tags"}
 
 // sanitizeUTF8 removes or replaces invalid UTF-8 sequences and problematic Unicode characters
 func sanitizeUTF8(s string) string {
@@ -113,6 +115,7 @@ func (c *CSVStorage) overwrite(cards []Card) error {
 			fmt.Sprintf("%d", card.WordCount),
 			card.CreatedAt,
 			card.SourceFilename,
+			strings.Join(card.Tags, "|"),
 		}
 	})
 
@@ -208,6 +211,30 @@ func (c *CSVStorage) PruneDupes() error {
 	return c.overwrite(dedupedCards)
 }
 
+func (c *CSVStorage) UpdateTags(cards []Card) error {
+	// For CSV, we need to reload all cards, update the matching ones, and rewrite the file
+	existingCards, err := c.Load()
+	if err != nil {
+		return fmt.Errorf("failed to load existing cards: %w", err)
+	}
+
+	// Create a map of cards to update for faster lookup
+	updateMap := make(map[string]Card)
+	for _, card := range cards {
+		updateMap[card.CardID] = card
+	}
+
+	// Update existing cards with new tag information
+	for i, existing := range existingCards {
+		if updated, found := updateMap[existing.CardID]; found {
+			existingCards[i].Tags = updated.Tags
+		}
+	}
+
+	// Rewrite the entire file with updated cards
+	return c.overwrite(existingCards)
+}
+
 // Close does nothing because of the way we handle files right now
 func (c *CSVStorage) Close() error {
 	return nil
@@ -288,6 +315,15 @@ func (c *CSVStorage) parseRecord(record []string) (Card, error) {
 
 	card.SourceFilename = record[19]
 
+	// Parse tags from pipe-separated string
+	if len(record) > 20 && record[20] != "" {
+		tags := strings.Split(record[20], "|")
+		for i, tag := range tags {
+			tags[i] = strings.TrimSpace(tag)
+		}
+		card.Tags = tags
+	}
+
 	return card, nil
 }
 
@@ -330,7 +366,18 @@ CREATE TABLE IF NOT EXISTS debate_cards (
         );
 	`
 
+	// Add tags column if it doesn't exist
+	addTagsColumnQuery := `
+ALTER TABLE debate_cards 
+ADD COLUMN IF NOT EXISTS tags TEXT[] DEFAULT '{}';
+	`
+
 	_, err = conn.Exec(context.Background(), createCardsTabelQuery)
+	if err != nil {
+		return nil, err
+	}
+
+	_, err = conn.Exec(context.Background(), addTagsColumnQuery)
 	if err != nil {
 		return nil, err
 	}
@@ -363,6 +410,7 @@ func (p *PostgresStorage) scanCard(scanner interface {
 }, card *Card,
 ) error {
 	var createdAt time.Time
+	var tags []string
 	err := scanner.Scan(
 		&card.CardID,
 		&card.Tagline,
@@ -386,6 +434,7 @@ func (p *PostgresStorage) scanCard(scanner interface {
 		&card.WordCount,
 		&card.HighlightCount,
 		&createdAt,
+		&tags,
 	)
 	if err != nil {
 		return err
@@ -393,6 +442,7 @@ func (p *PostgresStorage) scanCard(scanner interface {
 
 	// Convert time.Time to string format matching the Card struct
 	card.CreatedAt = createdAt.Format("2006-01-02 15:04:05.000000")
+	card.Tags = tags
 	return nil
 }
 
@@ -409,9 +459,9 @@ func (p *PostgresStorage) Save(cards []Card) error {
             author_surname, author_year, author_credentials, publication_title,
             publisher, url, credits, body_text, body_html, highlighted_text,
             source_filename, paragraph_start, paragraph_end, word_count,
-            highlight_count, created_at
+            highlight_count, created_at, tags
         ) VALUES (
-  					$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22
+  					$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23
         ) ON CONFLICT (card_id) DO NOTHING;`
 
 	batch := &pgx.Batch{}
@@ -494,6 +544,7 @@ func (p *PostgresStorage) Save(cards []Card) error {
 			card.WordCount,
 			card.HighlightCount,
 			card.CreatedAt,
+			card.Tags,
 		)
 	}
 
@@ -532,7 +583,7 @@ func (p *PostgresStorage) Load() ([]Card, error) {
 		author_surname, author_year, author_credentials, publication_title,
 		publisher, url, credits, body_text, body_html, highlighted_text,
 		source_filename, paragraph_start, paragraph_end, word_count,
-		highlight_count, created_at
+		highlight_count, created_at, tags
 	FROM debate_cards
 	ORDER BY created_at DESC`
 
@@ -647,6 +698,52 @@ func (p *PostgresStorage) PruneDupes() error {
 	}).Info("Duplicate detection completed")
 
 	return p.deleteIDs(cardIDsToDelete)
+}
+
+func (p *PostgresStorage) UpdateTags(cards []Card) error {
+	if len(cards) == 0 {
+		logrus.Debug("No cards to update tags for")
+		return nil
+	}
+
+	logrus.WithField("card_count", len(cards)).Info("Updating card tags in database")
+
+	updateQuery := `UPDATE debate_cards SET tags = $2 WHERE card_id = $1`
+	batch := &pgx.Batch{}
+
+	for _, card := range cards {
+		batch.Queue(updateQuery, card.CardID, card.Tags)
+	}
+
+	results := p.connection.SendBatch(context.Background(), batch)
+	defer results.Close()
+
+	updatedCount := 0
+	errorCount := 0
+
+	for i := range cards {
+		res, err := results.Exec()
+		if err != nil {
+			logrus.WithError(err).WithFields(logrus.Fields{
+				"card_index": i,
+				"card_id":    cards[i].CardID,
+			}).Warn("Error updating card tags")
+			errorCount++
+			continue
+		}
+
+		if res.RowsAffected() > 0 {
+			updatedCount++
+		}
+	}
+
+	logrus.WithFields(logrus.Fields{
+		"updated": updatedCount,
+		"total":   len(cards),
+		"errors":  errorCount,
+	}).Info("Card tags update completed")
+
+	return nil
 }
 
 func (p *PostgresStorage) Close() error {
