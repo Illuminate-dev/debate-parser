@@ -492,7 +492,19 @@ func (p *PostgresStorage) Save(cards []Card) error {
 
 	logrus.WithField("card_count", len(cards)).Info("Saving cards to database")
 
-	insertQuery := `INSERT INTO debate_cards (
+	// Check if any cards have tags to determine if we need to capture DB IDs
+	hasAnyTags := false
+	for _, card := range cards {
+		if len(card.Tags) > 0 {
+			hasAnyTags = true
+			break
+		}
+	}
+
+	// Use RETURNING clause only if we need DB IDs for tags
+	var insertQuery string
+	if hasAnyTags {
+		insertQuery = `INSERT INTO debate_cards (
             card_id, tagline, tagline_html, citation_raw, citation_html, cite,
             author_surname, author_year, author_credentials, publication_title,
             publisher, url, credits, body_text, body_html, highlighted_text,
@@ -501,6 +513,17 @@ func (p *PostgresStorage) Save(cards []Card) error {
         ) VALUES (
   					$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23
         ) ON CONFLICT (card_id) DO UPDATE SET card_id = EXCLUDED.card_id RETURNING id, card_id;`
+	} else {
+		insertQuery = `INSERT INTO debate_cards (
+            card_id, tagline, tagline_html, citation_raw, citation_html, cite,
+            author_surname, author_year, author_credentials, publication_title,
+            publisher, url, credits, body_text, body_html, highlighted_text,
+            source_filename, global_path, paragraph_start, paragraph_end, word_count,
+            highlight_count, created_at
+        ) VALUES (
+  					$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23
+        ) ON CONFLICT (card_id) DO UPDATE SET card_id = EXCLUDED.card_id;`
+	}
 
 	batch := &pgx.Batch{}
 	truncatedCount := 0
@@ -592,28 +615,42 @@ func (p *PostgresStorage) Save(cards []Card) error {
 	errorCount := 0
 	cardDBIDs := make(map[string]int)
 
-	for i := range cards {
-		rows, err := results.Query()
-		if err != nil {
-			logrus.WithError(err).WithField("card_index", i).Warn("Error saving card")
-			errorCount++
-			continue
-		}
+	if hasAnyTags {
+		// Process results with Query() to capture DB IDs for tag relationships
+		for i := range cards {
+			rows, err := results.Query()
+			if err != nil {
+				logrus.WithError(err).WithField("card_index", i).Warn("Error saving card")
+				errorCount++
+				continue
+			}
 
-		if rows.Next() {
-			var dbID int
-			var cardID string
-			if err := rows.Scan(&dbID, &cardID); err != nil {
-				logrus.WithError(err).WithField("card_index", i).Warn("Error scanning card result")
+			if rows.Next() {
+				var dbID int
+				var cardID string
+				if err := rows.Scan(&dbID, &cardID); err != nil {
+					logrus.WithError(err).WithField("card_index", i).Warn("Error scanning card result")
+					errorCount++
+				} else {
+					cardDBIDs[cardID] = dbID
+					savedCount++
+				}
+			}
+			rows.Close()
+		}
+	} else {
+		// Fast path: just use Exec() when no tags need to be saved
+		for i := range cards {
+			_, err := results.Exec()
+			if err != nil {
+				logrus.WithError(err).WithField("card_index", i).Warn("Error saving card")
 				errorCount++
 			} else {
-				cardDBIDs[cardID] = dbID
 				savedCount++
 			}
 		}
-		rows.Close()
 	}
-	
+
 	// Explicitly close the batch results to free the connection
 	results.Close()
 

@@ -230,7 +230,14 @@ func (p *Parser) ParseZip(path string) error {
 			continue
 		}
 
-		p.parseDocx(doc, file.Name)
+		// Build source file path as: zipfile.zip/internal/path.docx
+		// Clean the file name to ensure it's relative (strip any absolute path prefixes)
+		cleanFileName := filepath.Clean(file.Name)
+		if filepath.IsAbs(cleanFileName) {
+			cleanFileName = filepath.Base(cleanFileName)
+		}
+		sourceFile := filepath.Base(path) + "/" + cleanFileName
+		p.parseDocx(doc, sourceFile)
 		successCount++
 	}
 
