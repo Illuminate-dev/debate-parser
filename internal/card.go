@@ -35,6 +35,7 @@ type Card struct {
 	CardID         string
 	CreatedAt      string
 	SourceFilename string
+	GlobalPath     string   // Complete hierarchical path: zip/docx/H1/H2/H3
 	ParagraphStart int
 	ParagraphEnd   int
 	Tags           []string // New field for tags
@@ -54,9 +55,9 @@ var (
 	CreditsRegex     *regexp.Regexp = regexp.MustCompile(`(?://\s*(.+)|(?:^|\s)-\s*([A-Z][A-Za-z\s]*))$`)
 )
 
-// ParseCard takes a slice of items, then attempts to parse a card starting that that position,
+// ParseCard takes a slice of items and a globalPath, then attempts to parse a card starting at that position,
 // returning an error on failure. Also returns an index at which the card stopped parsing
-func ParseCard(items []any) (Card, int, error) {
+func ParseCard(items []any, globalPath string) (Card, int, error) {
 	var card Card
 	var endIdx int
 
@@ -131,6 +132,7 @@ loop:
 
 	card.CardID = uuid.NewString()
 	card.CreatedAt = time.Now().Format("2006-01-02 15:04:05.000000")
+	card.GlobalPath = globalPath
 
 	return card, endIdx, nil
 }

@@ -26,6 +26,55 @@ func NewParser(storage CardStorage) *Parser {
 	}
 }
 
+// headerContext tracks the current header hierarchy as we parse the document
+type headerContext struct {
+	h1, h2, h3 string
+}
+
+// buildGlobalPath constructs the complete hierarchical path for a card
+func (h *headerContext) buildGlobalPath(sourceFile string) string {
+	path := sourceFile
+	if h.h1 != "" {
+		path += "/" + h.h1
+	}
+	if h.h2 != "" {
+		path += "/" + h.h2
+	}
+	if h.h3 != "" {
+		path += "/" + h.h3
+	}
+	return path
+}
+
+// updateHeader updates the header context based on the heading level
+func (h *headerContext) updateHeader(level int, text string) {
+	switch level {
+	case 1:
+		h.h1 = text
+		h.h2 = ""
+		h.h3 = ""
+	case 2:
+		h.h2 = text
+		h.h3 = ""
+	case 3:
+		h.h3 = text
+	}
+}
+
+// isHeading checks if a paragraph is a heading and returns the level (1-3), or 0 if not a heading
+func isHeading(para *docx.Paragraph) int {
+	if checkStyle(para, "Heading1") {
+		return 1
+	}
+	if checkStyle(para, "Heading2") {
+		return 2
+	}
+	if checkStyle(para, "Heading3") {
+		return 3
+	}
+	return 0
+}
+
 func (p *Parser) parseDocx(doc *docx.Docx, sourceFile string) {
 	totalItems := len(doc.Document.Body.Items)
 	logrus.WithFields(logrus.Fields{
@@ -36,10 +85,24 @@ func (p *Parser) parseDocx(doc *docx.Docx, sourceFile string) {
 	i := 0
 	cardsFound := 0
 	malformedCount := 0
+	headers := headerContext{}
 
 	for i < totalItems {
+		// Check if current item is a heading and update context
+		if para, ok := doc.Document.Body.Items[i].(*docx.Paragraph); ok {
+			if level := isHeading(para); level > 0 {
+				headers.updateHeader(level, para.String())
+				logrus.WithFields(logrus.Fields{
+					"level": level,
+					"text":  para.String(),
+				}).Debug("Header detected")
+				i++
+				continue
+			}
+		}
 
-		card, endIdx, err := ParseCard(doc.Document.Body.Items[i:])
+		globalPath := headers.buildGlobalPath(sourceFile)
+		card, endIdx, err := ParseCard(doc.Document.Body.Items[i:], globalPath)
 		switch err {
 		case nil:
 			card.SourceFilename = filepath.Base(sourceFile)
@@ -49,8 +112,9 @@ func (p *Parser) parseDocx(doc *docx.Docx, sourceFile string) {
 			cardsFound++
 			i += endIdx
 			logrus.WithFields(logrus.Fields{
-				"card_id": card.CardID,
-				"tagline": card.Tagline[:min(50, len(card.Tagline))],
+				"card_id":     card.CardID,
+				"tagline":     card.Tagline[:min(50, len(card.Tagline))],
+				"global_path": card.GlobalPath,
 			}).Debug("Parsed card")
 		case ErrNotCitation:
 			logrus.WithFields(logrus.Fields{

@@ -23,7 +23,7 @@ type CardStorage interface {
 	Close() error
 }
 
-var CSVHeaders = []string{"CardID", "Tagline", "TaglineHTML", "Citation", "CitationHTML", "Cite", "AuthorSurname", "AuthorYear", "AuthorCreds", "PublicationTitle", "Publisher", "URL", "Credits", "Body", "BodyHTML", "HighlightCount", "HighlightedText", "WordCount", "CreatedAt", "SourceFilename", "Tags"}
+var CSVHeaders = []string{"CardID", "Tagline", "TaglineHTML", "Citation", "CitationHTML", "Cite", "AuthorSurname", "AuthorYear", "AuthorCreds", "PublicationTitle", "Publisher", "URL", "Credits", "Body", "BodyHTML", "HighlightCount", "HighlightedText", "WordCount", "CreatedAt", "SourceFilename", "GlobalPath", "Tags"}
 
 // sanitizeUTF8 removes or replaces invalid UTF-8 sequences and problematic Unicode characters
 func sanitizeUTF8(s string) string {
@@ -115,6 +115,7 @@ func (c *CSVStorage) overwrite(cards []Card) error {
 			fmt.Sprintf("%d", card.WordCount),
 			card.CreatedAt,
 			card.SourceFilename,
+			card.GlobalPath,
 			strings.Join(card.Tags, "|"),
 		}
 	})
@@ -160,6 +161,11 @@ func (c *CSVStorage) PruneDupes() error {
 
 	logrus.WithField("total_cards", len(existingCards)).Info("Starting duplicate removal from CSV")
 
+	// Reverse the cards so we process newest first (assuming newer cards are at the end of the file)
+	for i, j := 0, len(existingCards)-1; i < j; i, j = i+1, j-1 {
+		existingCards[i], existingCards[j] = existingCards[j], existingCards[i]
+	}
+
 	dedupedCards := make([]Card, 0, len(existingCards))
 	minHashLSH := NewMinHashLSH(128, 16)
 
@@ -176,7 +182,7 @@ func (c *CSVStorage) PruneDupes() error {
 
 		key := fmt.Sprintf("%v %v %v %v", card.Tagline, card.AuthorSurname, card.AuthorYear, FirstN(card.Body, 200))
 		potentialDupes := minHashLSH.CheckForDuplicates(key, ShingleSize)
-		
+
 		isDuplicate := false
 		if len(potentialDupes) > 0 {
 			for _, dupe := range potentialDupes {
@@ -186,7 +192,7 @@ func (c *CSVStorage) PruneDupes() error {
 						"card_id":    card.CardID,
 						"dupe_id":    dupe,
 						"similarity": fmt.Sprintf("%.2f", similarity),
-					}).Debug("Duplicate found")
+					}).Debug("Duplicate found - keeping newer card")
 					duplicatesFound++
 					isDuplicate = true
 					break
@@ -201,6 +207,11 @@ func (c *CSVStorage) PruneDupes() error {
 	}
 
 	bar.Finish()
+
+	// Reverse dedupedCards back to original order (oldest first)
+	for i, j := 0, len(dedupedCards)-1; i < j; i, j = i+1, j-1 {
+		dedupedCards[i], dedupedCards[j] = dedupedCards[j], dedupedCards[i]
+	}
 
 	logrus.WithFields(logrus.Fields{
 		"original_count":  len(existingCards),
@@ -314,10 +325,11 @@ func (c *CSVStorage) parseRecord(record []string) (Card, error) {
 	}
 
 	card.SourceFilename = record[19]
+	card.GlobalPath = record[20]
 
 	// Parse tags from pipe-separated string
-	if len(record) > 20 && record[20] != "" {
-		tags := strings.Split(record[20], "|")
+	if len(record) > 21 && record[21] != "" {
+		tags := strings.Split(record[21], "|")
 		for i, tag := range tags {
 			tags[i] = strings.TrimSpace(tag)
 		}
@@ -358,6 +370,7 @@ CREATE TABLE IF NOT EXISTS debate_cards (
             body_html TEXT,
             highlighted_text TEXT,
             source_filename VARCHAR(255),
+            global_path TEXT,
             paragraph_start INTEGER,
             paragraph_end INTEGER,
             word_count INTEGER,
@@ -429,6 +442,7 @@ func (p *PostgresStorage) scanCard(scanner interface {
 }, card *Card,
 ) error {
 	var createdAt time.Time
+	var globalPath *string // Use nullable string to handle NULL values
 	err := scanner.Scan(
 		&card.CardID,
 		&card.Tagline,
@@ -447,6 +461,7 @@ func (p *PostgresStorage) scanCard(scanner interface {
 		&card.BodyHTML,
 		&card.HighlightedText,
 		&card.SourceFilename,
+		&globalPath,
 		&card.ParagraphStart,
 		&card.ParagraphEnd,
 		&card.WordCount,
@@ -455,6 +470,13 @@ func (p *PostgresStorage) scanCard(scanner interface {
 	)
 	if err != nil {
 		return err
+	}
+
+	// Handle NULL global_path values
+	if globalPath != nil {
+		card.GlobalPath = *globalPath
+	} else {
+		card.GlobalPath = ""
 	}
 
 	// Convert time.Time to string format matching the Card struct
@@ -474,10 +496,10 @@ func (p *PostgresStorage) Save(cards []Card) error {
             card_id, tagline, tagline_html, citation_raw, citation_html, cite,
             author_surname, author_year, author_credentials, publication_title,
             publisher, url, credits, body_text, body_html, highlighted_text,
-            source_filename, paragraph_start, paragraph_end, word_count,
+            source_filename, global_path, paragraph_start, paragraph_end, word_count,
             highlight_count, created_at
         ) VALUES (
-  					$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22
+  					$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23
         ) ON CONFLICT (card_id) DO UPDATE SET card_id = EXCLUDED.card_id RETURNING id, card_id;`
 
 	batch := &pgx.Batch{}
@@ -555,6 +577,7 @@ func (p *PostgresStorage) Save(cards []Card) error {
 			card.BodyHTML,
 			card.HighlightedText,
 			card.SourceFilename,
+			card.GlobalPath,
 			card.ParagraphStart,
 			card.ParagraphEnd,
 			card.WordCount,
@@ -842,11 +865,11 @@ func (p *PostgresStorage) getCardDBIDs(cards []Card) (map[string]int, error) {
 }
 
 func (p *PostgresStorage) Load() ([]Card, error) {
-	query := `SELECT 
+	query := `SELECT
 		card_id, tagline, tagline_html, citation_raw, citation_html, cite,
 		author_surname, author_year, author_credentials, publication_title,
 		publisher, url, credits, body_text, body_html, highlighted_text,
-		source_filename, paragraph_start, paragraph_end, word_count,
+		source_filename, global_path, paragraph_start, paragraph_end, word_count,
 		highlight_count, created_at
 	FROM debate_cards
 	ORDER BY created_at DESC`
