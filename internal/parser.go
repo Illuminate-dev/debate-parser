@@ -85,58 +85,74 @@ func (p *Parser) parseDocx(doc *docx.Docx, sourceFile string) {
 	i := 0
 	cardsFound := 0
 	malformedCount := 0
+	panicCount := 0
 	headers := headerContext{}
 
 	for i < totalItems {
-		// Check if current item is a heading and update context
-		if para, ok := doc.Document.Body.Items[i].(*docx.Paragraph); ok {
-			if level := isHeading(para); level > 0 {
-				headers.updateHeader(level, para.String())
-				logrus.WithFields(logrus.Fields{
-					"level": level,
-					"text":  para.String(),
-				}).Debug("Header detected")
-				i++
-				continue
-			}
-		}
+		// Recover from panics in malformed documents
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					logrus.WithFields(logrus.Fields{
+						"file":      sourceFile,
+						"paragraph": i,
+						"panic":     r,
+					}).Warn("Panic recovered while parsing paragraph")
+					panicCount++
+					i++ // Skip this paragraph and continue
+				}
+			}()
 
-		globalPath := headers.buildGlobalPath(sourceFile)
-		card, endIdx, err := ParseCard(doc.Document.Body.Items[i:], globalPath)
-		switch err {
-		case nil:
-			card.SourceFilename = filepath.Base(sourceFile)
-			card.ParagraphStart = i
-			card.ParagraphEnd = i + endIdx - 1
-			p.Cards = append(p.Cards, card)
-			cardsFound++
-			i += endIdx
-			logrus.WithFields(logrus.Fields{
-				"card_id":     card.CardID,
-				"tagline":     card.Tagline[:min(50, len(card.Tagline))],
-				"global_path": card.GlobalPath,
-			}).Debug("Parsed card")
-		case ErrNotCitation:
-			logrus.WithFields(logrus.Fields{
-				"paragraph": i,
-				"error":     err.Error(),
-			}).Debug("Malformed citation encountered")
-			malformedCount++
-			i += 1
-		default:
-			logrus.WithFields(logrus.Fields{
-				"paragraph": i,
-				"error":     err.Error(),
-			}).Debug("Skipping paragraph")
-			i += 1
-			continue
-		}
+			// Check if current item is a heading and update context
+			if para, ok := doc.Document.Body.Items[i].(*docx.Paragraph); ok {
+				if level := isHeading(para); level > 0 {
+					headers.updateHeader(level, para.String())
+					logrus.WithFields(logrus.Fields{
+						"level": level,
+						"text":  para.String(),
+					}).Debug("Header detected")
+					i++
+					return
+				}
+			}
+
+			globalPath := headers.buildGlobalPath(sourceFile)
+			card, endIdx, err := ParseCard(doc.Document.Body.Items[i:], globalPath)
+			switch err {
+			case nil:
+				card.SourceFilename = filepath.Base(sourceFile)
+				card.ParagraphStart = i
+				card.ParagraphEnd = i + endIdx - 1
+				p.Cards = append(p.Cards, card)
+				cardsFound++
+				i += endIdx
+				logrus.WithFields(logrus.Fields{
+					"card_id":     card.CardID,
+					"tagline":     card.Tagline[:min(50, len(card.Tagline))],
+					"global_path": card.GlobalPath,
+				}).Debug("Parsed card")
+			case ErrNotCitation:
+				logrus.WithFields(logrus.Fields{
+					"paragraph": i,
+					"error":     err.Error(),
+				}).Debug("Malformed citation encountered")
+				malformedCount++
+				i += 1
+			default:
+				logrus.WithFields(logrus.Fields{
+					"paragraph": i,
+					"error":     err.Error(),
+				}).Debug("Skipping paragraph")
+				i += 1
+			}
+		}()
 	}
 
 	logrus.WithFields(logrus.Fields{
 		"file":            sourceFile,
 		"cards_found":     cardsFound,
 		"malformed":       malformedCount,
+		"panics_recovered": panicCount,
 		"total_processed": totalItems,
 	}).Debug("Document parsing completed")
 }
