@@ -18,13 +18,13 @@ var tagCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		inputFile := args[0]
 		tagsStr := args[1]
-		
-		// Parse tags from comma-separated string (CLI input uses commas)
+
+		// Parse tags from comma-separated string
 		tags := strings.Split(tagsStr, ",")
 		for i, tag := range tags {
 			tags[i] = strings.TrimSpace(tag)
 		}
-		
+
 		logrus.WithFields(logrus.Fields{
 			"file": inputFile,
 			"tags": tags,
@@ -76,3 +76,4 @@ var tagCmd = &cobra.Command{
 func init() {
 	rootCmd.AddCommand(tagCmd)
 }
+

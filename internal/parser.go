@@ -15,15 +15,44 @@ import (
 )
 
 type Parser struct {
-	Cards   []Card
-	Storage CardStorage
+	Cards     []Card
+	Storage   CardStorage
+	batchSize int
 }
 
 func NewParser(storage CardStorage) *Parser {
 	return &Parser{
-		Cards:   make([]Card, 0),
-		Storage: storage,
+		Cards:     make([]Card, 0, 1000), // Pre-allocate capacity for first batch
+		Storage:   storage,
+		batchSize: 1000, // Default batch size of 1000 cards
 	}
+}
+
+// SetBatchSize configures how many cards to accumulate before saving to storage
+func (p *Parser) SetBatchSize(size int) {
+	if size > 0 {
+		p.batchSize = size
+	}
+}
+
+// saveBatch saves the current batch of cards and clears memory
+func (p *Parser) saveBatch() error {
+	if len(p.Cards) == 0 {
+		return nil
+	}
+
+	logrus.WithField("batch_size", len(p.Cards)).Debug("Saving batch to storage")
+
+	err := p.Storage.Save(p.Cards)
+	if err != nil {
+		return err
+	}
+
+	// Clear slice but keep capacity to avoid reallocations
+	p.Cards = p.Cards[:0]
+
+	logrus.Debug("Batch saved and memory cleared")
+	return nil
 }
 
 // headerContext tracks the current header hierarchy as we parse the document
@@ -131,6 +160,13 @@ func (p *Parser) parseDocx(doc *docx.Docx, sourceFile string) {
 					"tagline":     card.Tagline[:min(50, len(card.Tagline))],
 					"global_path": card.GlobalPath,
 				}).Debug("Parsed card")
+
+				// Save batch if we've reached the batch size
+				if len(p.Cards) >= p.batchSize {
+					if err := p.saveBatch(); err != nil {
+						logrus.WithError(err).Warn("Failed to save batch during parsing")
+					}
+				}
 			case ErrNotCitation:
 				logrus.WithFields(logrus.Fields{
 					"paragraph": i,
@@ -149,11 +185,11 @@ func (p *Parser) parseDocx(doc *docx.Docx, sourceFile string) {
 	}
 
 	logrus.WithFields(logrus.Fields{
-		"file":            sourceFile,
-		"cards_found":     cardsFound,
-		"malformed":       malformedCount,
+		"file":             sourceFile,
+		"cards_found":      cardsFound,
+		"malformed":        malformedCount,
 		"panics_recovered": panicCount,
-		"total_processed": totalItems,
+		"total_processed":  totalItems,
 	}).Debug("Document parsing completed")
 }
 
@@ -208,7 +244,8 @@ func (p *Parser) ParseZip(path string) error {
 		"docx_files":  len(docxFiles),
 	}).Info("Processing ZIP archive")
 
-	bar := progressbar.NewOptions(len(docxFiles),
+	bar := progressbar.NewOptions(
+		len(docxFiles),
 		progressbar.OptionSetDescription("Processing DOCX files"),
 		progressbar.OptionShowCount(),
 		progressbar.OptionSetWidth(50),
@@ -269,8 +306,14 @@ func (p *Parser) ParseZip(path string) error {
 	return nil
 }
 
+// Flush saves any remaining cards in the current batch
+func (p *Parser) Flush() error {
+	return p.saveBatch()
+}
+
+// Save flushes any remaining cards to storage
 func (p *Parser) Save() error {
-	return p.Storage.Save(p.Cards)
+	return p.Flush()
 }
 
 func (p *Parser) GetCards() []Card {

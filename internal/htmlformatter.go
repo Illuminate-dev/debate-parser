@@ -174,9 +174,9 @@ func isBold(props *docx.RunProperties) bool {
 	}
 	if props.RunStyle != nil {
 		styleLower := strings.ToLower(props.RunStyle.Val)
-		return strings.Contains(styleLower, "bold") || 
-			   strings.Contains(styleLower, "emphasis") || 
-			   strings.Contains(styleLower, "strong")
+		return strings.Contains(styleLower, "bold") ||
+			strings.Contains(styleLower, "emphasis") ||
+			strings.Contains(styleLower, "strong")
 	}
 	return false
 }

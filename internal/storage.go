@@ -27,7 +27,7 @@ var CSVHeaders = []string{"CardID", "Tagline", "TaglineHTML", "Citation", "Citat
 
 // sanitizeUTF8 removes or replaces invalid UTF-8 sequences and problematic Unicode characters
 func sanitizeUTF8(s string) string {
-	// Replace common problematic Unicode characters that can cause database issues
+	// Replace common problematic Unicode characters
 	s = strings.ReplaceAll(s, "\u201C", "\"") // left double quotation mark
 	s = strings.ReplaceAll(s, "\u201D", "\"") // right double quotation mark
 	s = strings.ReplaceAll(s, "\u2018", "'")  // left single quotation mark
@@ -38,11 +38,11 @@ func sanitizeUTF8(s string) string {
 	s = strings.ReplaceAll(s, "\u00A0", " ")  // non-breaking space
 	s = strings.ReplaceAll(s, "\x00", "")     // null bytes
 	s = strings.ReplaceAll(s, "\uFFFD", "")   // replacement characters
-	s = strings.ReplaceAll(s, "\x92", "'")    // smart quote (Windows-1252)
-	s = strings.ReplaceAll(s, "\x93", "\"")   // smart quote (Windows-1252)
-	s = strings.ReplaceAll(s, "\x94", "\"")   // smart quote (Windows-1252)
-	s = strings.ReplaceAll(s, "\x96", "-")    // en dash (Windows-1252)
-	s = strings.ReplaceAll(s, "\x97", "--")   // em dash (Windows-1252)
+	s = strings.ReplaceAll(s, "\x92", "'")    // smart quote
+	s = strings.ReplaceAll(s, "\x93", "\"")   // smart quote
+	s = strings.ReplaceAll(s, "\x94", "\"")   // smart quote
+	s = strings.ReplaceAll(s, "\x96", "-")    // en dash
+	s = strings.ReplaceAll(s, "\x97", "--")   // em dash
 
 	// Ensure the result is valid UTF-8
 	if !utf8.ValidString(s) {
@@ -69,16 +69,65 @@ func NewCSVStorage(filepath string) *CSVStorage {
 }
 
 func (c *CSVStorage) Save(cards []Card) error {
-	// Read what's currently in the file
-	cardsToWrite, err := c.Load()
-	if err != nil {
-		cardsToWrite = make([]Card, 0)
+	if len(cards) == 0 {
+		return nil
 	}
 
-	cardsToWrite = append(cardsToWrite, cards...)
+	// Check if file exists and has content
+	fileExists := false
+	if stat, err := os.Stat(c.filepath); err == nil && stat.Size() > 0 {
+		fileExists = true
+	}
 
-	// Now just rewrite the entire file
-	return c.overwrite(cardsToWrite)
+	// Open file in append mode, create if doesn't exist
+	file, err := os.OpenFile(c.filepath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return fmt.Errorf("failed to open CSV file: %w", err)
+	}
+	defer file.Close()
+
+	writer := csv.NewWriter(file)
+	defer writer.Flush()
+
+	// Write header only if file is new/empty
+	if !fileExists {
+		if err := writer.Write(CSVHeaders); err != nil {
+			return fmt.Errorf("failed to write CSV header: %w", err)
+		}
+	}
+
+	// Append new cards
+	for _, card := range cards {
+		record := []string{
+			card.CardID,
+			card.Tagline,
+			card.TaglineHTML,
+			card.Citation,
+			card.CitationHTML,
+			card.Cite,
+			card.AuthorSurname,
+			card.AuthorYear,
+			card.AuthorCreds,
+			card.PublicationTitle,
+			card.Publisher,
+			card.URL,
+			card.Credits,
+			card.Body,
+			card.BodyHTML,
+			fmt.Sprintf("%d", card.HighlightCount),
+			card.HighlightedText,
+			fmt.Sprintf("%d", card.WordCount),
+			card.CreatedAt,
+			card.SourceFilename,
+			card.GlobalPath,
+			strings.Join(card.Tags, "|"),
+		}
+		if err := writer.Write(record); err != nil {
+			return fmt.Errorf("failed to write card record: %w", err)
+		}
+	}
+
+	return writer.Error()
 }
 
 func (c *CSVStorage) overwrite(cards []Card) error {
@@ -161,7 +210,7 @@ func (c *CSVStorage) PruneDupes() error {
 
 	logrus.WithField("total_cards", len(existingCards)).Info("Starting duplicate removal from CSV")
 
-	// Reverse the cards so we process newest first (assuming newer cards are at the end of the file)
+	// Reverse the cards so we process newest first
 	for i, j := 0, len(existingCards)-1; i < j; i, j = i+1, j-1 {
 		existingCards[i], existingCards[j] = existingCards[j], existingCards[i]
 	}
@@ -169,7 +218,8 @@ func (c *CSVStorage) PruneDupes() error {
 	dedupedCards := make([]Card, 0, len(existingCards))
 	minHashLSH := NewMinHashLSH(128, 16)
 
-	bar := progressbar.NewOptions(len(existingCards),
+	bar := progressbar.NewOptions(
+		len(existingCards),
 		progressbar.OptionSetDescription("Removing duplicates"),
 		progressbar.OptionShowCount(),
 		progressbar.OptionSetWidth(50),
@@ -208,7 +258,7 @@ func (c *CSVStorage) PruneDupes() error {
 
 	bar.Finish()
 
-	// Reverse dedupedCards back to original order (oldest first)
+	// Reverse dedupedCards back to original order
 	for i, j := 0, len(dedupedCards)-1; i < j; i, j = i+1, j-1 {
 		dedupedCards[i], dedupedCards[j] = dedupedCards[j], dedupedCards[i]
 	}
@@ -311,7 +361,7 @@ func (c *CSVStorage) parseRecord(record []string) (Card, error) {
 		card.WordCount = wordCount
 	}
 
-	// Parse created_at - you might need to adjust this based on your date format
+	// Parse created_at
 	if record[18] != "" {
 		createdAt, err := time.Parse(time.RFC3339, record[18])
 		if err != nil {
@@ -349,7 +399,6 @@ func NewPostgresStorage(url string) (*PostgresStorage, error) {
 		return nil, err
 	}
 
-	// Create tables following the Prisma schema
 	createCardsTabelQuery := `
 CREATE TABLE IF NOT EXISTS debate_cards (
             id SERIAL PRIMARY KEY,
@@ -582,7 +631,8 @@ func (p *PostgresStorage) Save(cards []Card) error {
 			truncatedCount++
 		}
 
-		batch.Queue(insertQuery,
+		batch.Queue(
+			insertQuery,
 			card.CardID,
 			card.Tagline,
 			card.TaglineHTML,
@@ -651,7 +701,6 @@ func (p *PostgresStorage) Save(cards []Card) error {
 		}
 	}
 
-	// Explicitly close the batch results to free the connection
 	results.Close()
 
 	// Handle tags for all cards using the captured DB IDs
@@ -661,7 +710,7 @@ func (p *PostgresStorage) Save(cards []Card) error {
 			cardsWithTags = append(cardsWithTags, card)
 		}
 	}
-	
+
 	if len(cardsWithTags) > 0 {
 		err := p.saveTagsWithDBIDs(cardsWithTags, cardDBIDs)
 		if err != nil {
@@ -697,7 +746,7 @@ func (p *PostgresStorage) saveTagsWithDBIDs(cards []Card, cardDBIDs map[string]i
 
 	// Insert tags using individual queries to avoid connection busy issues
 	insertTagQuery := `INSERT INTO tags (name) VALUES ($1) ON CONFLICT (name) DO NOTHING`
-	
+
 	for tag := range allTags {
 		_, err := p.connection.Exec(context.Background(), insertTagQuery, tag)
 		if err != nil {
@@ -731,7 +780,7 @@ func (p *PostgresStorage) saveTags(cards []Card) error {
 		return nil
 	}
 
-	// Insert tags (ignore conflicts)
+	// Insert tags
 	insertTagQuery := `INSERT INTO tags (name) VALUES ($1) ON CONFLICT (name) DO NOTHING`
 	batch := &pgx.Batch{}
 
@@ -740,7 +789,6 @@ func (p *PostgresStorage) saveTags(cards []Card) error {
 	}
 
 	results := p.connection.SendBatch(context.Background(), batch)
-	// Properly drain all results from the batch
 	for i := 0; i < len(allTags); i++ {
 		_, err := results.Exec()
 		if err != nil {
@@ -786,13 +834,12 @@ func (p *PostgresStorage) getTagIDs(tags map[string]bool) (map[string]int, error
 	return tagIDs, rows.Err()
 }
 
-// insertCardTagRelationshipsWithDBIDs creates many-to-many relationships using provided DB IDs
 func (p *PostgresStorage) insertCardTagRelationshipsWithDBIDs(cards []Card, tagIDs map[string]int, cardDBIDs map[string]int) error {
 	insertRelQuery := `INSERT INTO debate_cards_tags (card_id, tag_id) VALUES ($1, $2) ON CONFLICT (card_id, tag_id) DO NOTHING`
-	
+
 	insertedCount := 0
 	skippedCount := 0
-	
+
 	for _, card := range cards {
 		cardDBID, cardExists := cardDBIDs[card.CardID]
 		if !cardExists {
@@ -816,11 +863,11 @@ func (p *PostgresStorage) insertCardTagRelationshipsWithDBIDs(cards []Card, tagI
 			}
 		}
 	}
-	
+
 	logrus.WithFields(logrus.Fields{
 		"inserted_relationships": insertedCount,
-		"skipped_cards":         skippedCount,
-		"total_cards":           len(cards),
+		"skipped_cards":          skippedCount,
+		"total_cards":            len(cards),
 	}).Debug("Card-tag relationship insertion completed")
 
 	return nil
@@ -833,11 +880,11 @@ func (p *PostgresStorage) insertCardTagRelationships(cards []Card, tagIDs map[st
 	if err != nil {
 		return fmt.Errorf("failed to get card database IDs: %w", err)
 	}
-	
+
 	// Log how many cards we found vs expected
 	logrus.WithFields(logrus.Fields{
 		"expected_cards": len(cards),
-		"found_cards":   len(cardDBIDs),
+		"found_cards":    len(cardDBIDs),
 	}).Debug("Card database ID lookup results")
 
 	insertRelQuery := `INSERT INTO debate_cards_tags (card_id, tag_id) VALUES ($1, $2) ON CONFLICT (card_id, tag_id) DO NOTHING`
@@ -862,7 +909,6 @@ func (p *PostgresStorage) insertCardTagRelationships(cards []Card, tagIDs map[st
 	}
 
 	results := p.connection.SendBatch(context.Background(), batch)
-	// Properly drain all results from the batch
 	for i := 0; i < batch.Len(); i++ {
 		_, err := results.Exec()
 		if err != nil {
@@ -1038,7 +1084,8 @@ func (p *PostgresStorage) PruneDupes() error {
 	cardIDsToDelete := make([]string, 0, len(cards))
 	minHashLSH := NewMinHashLSH(128, 16)
 
-	bar := progressbar.NewOptions(len(cards),
+	bar := progressbar.NewOptions(
+		len(cards),
 		progressbar.OptionSetDescription("Removing duplicates"),
 		progressbar.OptionShowCount(),
 		progressbar.OptionSetWidth(50),
@@ -1049,7 +1096,7 @@ func (p *PostgresStorage) PruneDupes() error {
 
 		key := fmt.Sprintf("%v %v %v %v", card.Tagline, card.AuthorSurname, card.AuthorYear, FirstN(card.Body, 200))
 		potentialDupes := minHashLSH.CheckForDuplicates(key, ShingleSize)
-		
+
 		isDuplicate := false
 		if len(potentialDupes) > 0 {
 			for _, dupe := range potentialDupes {
@@ -1075,9 +1122,9 @@ func (p *PostgresStorage) PruneDupes() error {
 	bar.Finish()
 
 	logrus.WithFields(logrus.Fields{
-		"total_cards":       len(cards),
-		"duplicates_found":  len(cardIDsToDelete),
-		"remaining_cards":   len(cards) - len(cardIDsToDelete),
+		"total_cards":      len(cards),
+		"duplicates_found": len(cardIDsToDelete),
+		"remaining_cards":  len(cards) - len(cardIDsToDelete),
 	}).Info("Duplicate detection completed")
 
 	return p.deleteIDs(cardIDsToDelete)

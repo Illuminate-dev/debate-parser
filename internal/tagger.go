@@ -28,7 +28,7 @@ func (t *Tagger) TagFromDocx(filepath string, tags []string) error {
 
 	// Get the newly parsed cards
 	newCards := parser.GetCards()
-	
+
 	return t.tagCards(newCards, tags)
 }
 
@@ -43,7 +43,7 @@ func (t *Tagger) TagFromZip(filepath string, tags []string) error {
 
 	// Get the newly parsed cards
 	newCards := parser.GetCards()
-	
+
 	return t.tagCards(newCards, tags)
 }
 
@@ -67,15 +67,15 @@ func (t *Tagger) tagCards(newCards []Card, tags []string) error {
 	for _, newCard := range newCards {
 		// Try to find matching existing card
 		matchingCard, found := t.findMatchingCard(newCard, existingCards)
-		
+
 		if found {
 			// Card exists, add tags to it
 			logrus.WithFields(logrus.Fields{
-				"card_id":  matchingCard.CardID,
-				"tagline":  FirstN(matchingCard.Tagline, 50),
+				"card_id": matchingCard.CardID,
+				"tagline": FirstN(matchingCard.Tagline, 50),
 			}).Debug("Found matching existing card")
-			
-			// Merge tags (avoid duplicates)
+
+			// Merge tags
 			existingTags := matchingCard.Tags
 			for _, tag := range tags {
 				if !contains(existingTags, tag) {
@@ -89,7 +89,7 @@ func (t *Tagger) tagCards(newCards []Card, tags []string) error {
 			logrus.WithFields(logrus.Fields{
 				"tagline": FirstN(newCard.Tagline, 50),
 			}).Debug("Adding new card with tags")
-			
+
 			newCard.Tags = append(newCard.Tags, tags...)
 			cardsToAdd = append(cardsToAdd, newCard)
 		}
@@ -149,3 +149,4 @@ func contains(slice []string, item string) bool {
 	}
 	return false
 }
+

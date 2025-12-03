@@ -10,6 +10,8 @@ import (
 	"github.com/spf13/cobra"
 )
 
+var batchSize int
+
 var parseCmd = &cobra.Command{
 	Use:   "parse <docx file>",
 	Short: "parse a .docx document",
@@ -37,6 +39,10 @@ var parseCmd = &cobra.Command{
 		defer storage.Close()
 
 		p := internal.NewParser(storage)
+		if batchSize > 0 {
+			p.SetBatchSize(batchSize)
+			logrus.WithField("batch_size", batchSize).Info("Using custom batch size")
+		}
 
 		switch filepath.Ext(inputFile) {
 		case ".docx":
@@ -79,4 +85,5 @@ var parseCmd = &cobra.Command{
 
 func init() {
 	rootCmd.AddCommand(parseCmd)
+	parseCmd.Flags().IntVar(&batchSize, "batch-size", 1000, "Number of cards to accumulate before saving")
 }

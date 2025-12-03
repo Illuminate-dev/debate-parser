@@ -35,10 +35,10 @@ type Card struct {
 	CardID         string
 	CreatedAt      string
 	SourceFilename string
-	GlobalPath     string   // Complete hierarchical path: zip/docx/H1/H2/H3
+	GlobalPath     string
 	ParagraphStart int
 	ParagraphEnd   int
-	Tags           []string // New field for tags
+	Tags           []string
 }
 
 var (
