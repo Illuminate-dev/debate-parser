@@ -10,7 +10,10 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var batchSize int
+var (
+	batchSize  int
+	skipDedupe bool
+)
 
 var parseCmd = &cobra.Command{
 	Use:   "parse <docx file>",
@@ -71,6 +74,12 @@ var parseCmd = &cobra.Command{
 			return err
 		}
 
+		if skipDedupe {
+			logrus.Info("Skipping duplicate removal process")
+			logrus.Info("Parse operation completed successfully")
+			return nil
+		}
+
 		logrus.Info("Starting duplicate removal process")
 		err = p.RemoveDuplicates()
 		if err != nil {
@@ -86,4 +95,5 @@ var parseCmd = &cobra.Command{
 func init() {
 	rootCmd.AddCommand(parseCmd)
 	parseCmd.Flags().IntVar(&batchSize, "batch-size", 1000, "Number of cards to accumulate before saving")
+	parseCmd.Flags().BoolVar(&skipDedupe, "skip-dedupe", false, "Skip duplicate detection after parsing")
 }
